@@ -21,7 +21,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ....configuration_utils import register_to_config
-from ....hooks._helpers import TransformerBlockMetadata
 from ....loaders.peft import PeftAdapterMixin
 from ....loaders.weight_mapping import WeightMappingMixin
 from ....utils import apply_lora_scale, logging
@@ -37,7 +36,7 @@ from ...embeddings import (
     get_1d_rotary_pos_embed,
 )
 from ...modeling_outputs import Transformer2DModelOutput
-from ...modeling_utils import ModelMixin, register_metadata
+from ...modeling_utils import ModelMixin
 from ...normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from ._ip_adapter import FluxIPAdapterMixin
 from ._weight_mapping import FLUX_WEIGHT_MAPPING
@@ -357,7 +356,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
 
 @maybe_allow_in_graph
-@register_metadata(TransformerBlockMetadata(return_hidden_states_index=1, return_encoder_hidden_states_index=0))
 class FluxSingleTransformerBlock(nn.Module):
     def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
         super().__init__()
@@ -412,7 +410,6 @@ class FluxSingleTransformerBlock(nn.Module):
 
 
 @maybe_allow_in_graph
-@register_metadata(TransformerBlockMetadata(return_hidden_states_index=1, return_encoder_hidden_states_index=0))
 class FluxTransformerBlock(nn.Module):
     def __init__(
         self, dim: int, num_attention_heads: int, attention_head_dim: int, qk_norm: str = "rms_norm", eps: float = 1e-6

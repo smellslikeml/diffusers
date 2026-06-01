@@ -321,28 +321,6 @@ class ModelMetadata:
         return "\n".join(lines)
 
 
-def register_metadata(metadata):
-    """Generic class decorator that attaches metadata to the decorated class.
-
-    Dispatches via ``metadata._register(cls)`` — each metadata dataclass owns its own attachment logic. Currently used
-    by :class:`~diffusers.hooks._helpers.TransformerBlockMetadata` to register block-level metadata into
-    :class:`TransformerBlockRegistry`::
-
-        @register_metadata(TransformerBlockMetadata(return_hidden_states_index=1, ...)) class
-        FluxTransformerBlock(nn.Module):
-            ...
-
-    Model-level capabilities are declared as plain class attributes on :class:`ModelMixin` (and on subsystem mixins or
-    model-specific ones like ``FluxIPAdapterMixin``) — no decorator needed.
-    """
-
-    def wrap(cls):
-        metadata._register(cls)
-        return cls
-
-    return wrap
-
-
 # Deprecation message reused across the per-backend attention helpers on ``ModelMixin`` (npu / xla / xformers).
 # These have been superseded by the unified ``set_attention_backend(...)`` / ``reset_attention_backend()`` API;
 # each call site supplies its specific replacement call as ``{replacement}``.

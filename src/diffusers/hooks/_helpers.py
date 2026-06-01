@@ -31,18 +31,6 @@ class TransformerBlockMetadata:
     _cls: Type = None
     _cached_parameter_indices: dict[str, int] = None
 
-    def _register(self, cls):
-        """Attach this metadata to ``cls`` and register it in :class:`TransformerBlockRegistry`.
-
-        Lets ``@register_metadata(TransformerBlockMetadata(...))`` work for block classes that opt into the decorator
-        pattern (e.g. Flux). Writes directly to the registry dict instead of going through
-        ``TransformerBlockRegistry.register`` so we don't trigger the lazy bulk-init while the decorated class's module
-        is mid-import (the bulk-init imports from the same module → circular).
-        """
-        self._cls = cls
-        cls._block_metadata = self
-        TransformerBlockRegistry._registry[cls] = self
-
     def _get_parameter_from_args_kwargs(self, identifier: str, args=(), kwargs=None):
         kwargs = kwargs or {}
         if identifier in kwargs:
