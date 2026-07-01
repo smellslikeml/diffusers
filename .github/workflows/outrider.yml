@@ -71,35 +71,22 @@ jobs:
             echo "ANTHROPIC_MODEL=$MODEL_INPUT" >> "$GITHUB_ENV"
           fi
       # REMYX-165: install cocoindex-code AST-based semantic code search
-      # as a Claude Code skill + pre-build the index on the target repo
-      # so cold-start indexing doesn't consume the claude-timeout budget
-      # during the implementation chain.
-      - name: Install cocoindex-code + pre-build index
+      # as a Claude Code skill. The skill handles indexing on demand
+      # per cocoindex-code's design ("no ccc init or ccc index needed
+      # — the skill teaches the agent to handle initialization,
+      # indexing, and searching on its own").
+      - name: Install cocoindex-code as Claude Code skill
         run: |
-          # Clone source tree for the .claude-plugin/ manifest
           git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
-          # Install the CLI
           pipx install 'cocoindex-code[full]'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           which ccc
-          # Symlink skill into Claude Code's scan path
           mkdir -p ~/.claude/skills/
           ln -sfn /tmp/cocoindex-code ~/.claude/skills/cocoindex-code
           echo "=== ~/.claude/skills/ ==="
           ls -la ~/.claude/skills/
           echo "=== .claude-plugin manifest ==="
           cat /tmp/cocoindex-code/.claude-plugin/plugin.json | head -30
-          # Pre-clone the target repo + build the AST index so the
-          # heavy indexing pass happens outside the Outrider chain's
-          # claude-timeout budget. Outrider's action clones to its own
-          # tmpdir; if cocoindex uses a global content-addressed cache,
-          # the second index (during the chain) becomes a warm-cache
-          # incremental update rather than a cold rebuild.
-          echo "=== pre-building AST index on target repo ==="
-          git clone --depth 1 https://github.com/${{ github.repository }} /tmp/target-repo-preindex
-          cd /tmp/target-repo-preindex
-          time ccc index . 2>&1 | tail -20 || echo "  (ccc index failed; continuing anyway)"
-          echo "=== index build complete ==="
       - uses: remyxai/outrider@v1
         with:
           interest-id: 6998975a-5301-43f0-bb61-9560ad933cb0
