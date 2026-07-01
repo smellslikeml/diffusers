@@ -70,6 +70,32 @@ jobs:
           if [ -n "$MODEL_INPUT" ]; then
             echo "ANTHROPIC_MODEL=$MODEL_INPUT" >> "$GITHUB_ENV"
           fi
+      # REMYX-165: install cocoindex-code AST-based semantic code search
+      # as a Claude Code skill. Tests whether AST-targeted lookups
+      # reduce the implementation chain's file-reading cost (and the
+      # in-place style churn that comes with reading too much of a file)
+      # vs the substring-grep + Read fallback.
+      - name: Install cocoindex-code as Claude Code skill
+        run: |
+          # Clone source tree so we have the .claude-plugin/ manifest
+          # (pipx install may not preserve dot-directories from the
+          # source distribution).
+          git clone --depth 1 https://github.com/cocoindex-io/cocoindex-code /tmp/cocoindex-code
+          # Install the CLI via pipx for isolation.
+          pipx install 'cocoindex-code[full]'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          which ccc
+          # Symlink into Claude Code's skill scan path so it's
+          # discoverable at agent session start. Claude Code loads
+          # ~/.claude/skills/<name>/.claude-plugin/*.json at startup.
+          mkdir -p ~/.claude/skills/
+          ln -sfn /tmp/cocoindex-code ~/.claude/skills/cocoindex-code
+          echo "=== ~/.claude/skills/ ==="
+          ls -la ~/.claude/skills/
+          echo "=== cocoindex-code/.claude-plugin/ ==="
+          ls -la /tmp/cocoindex-code/.claude-plugin/ 2>&1 | head -20
+          echo "=== plugin manifest contents ==="
+          cat /tmp/cocoindex-code/.claude-plugin/*.json 2>&1 | head -50 || true
       - uses: remyxai/outrider@v1
         with:
           interest-id: 6998975a-5301-43f0-bb61-9560ad933cb0
