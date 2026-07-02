@@ -22,6 +22,7 @@ except OptionalDependencyNotAvailable:
 
     _dummy_objects.update(get_objects_from_module(dummy_torch_and_transformers_objects))
 else:
+    _import_structure["phase_lock"] = ["PhaseLockGuidance"]
     _import_structure["pipeline_anyflow"] = ["AnyFlowPipeline"]
     _import_structure["pipeline_anyflow_far"] = ["AnyFlowFARPipeline"]
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
@@ -32,6 +33,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
     except OptionalDependencyNotAvailable:
         from ...utils.dummy_torch_and_transformers_objects import *
     else:
+        from .phase_lock import PhaseLockGuidance
         from .pipeline_anyflow import AnyFlowPipeline
         from .pipeline_anyflow_far import AnyFlowFARPipeline
 else:

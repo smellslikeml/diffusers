@@ -29,6 +29,7 @@ from ...utils import is_ftfy_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ...video_processor import VideoProcessor
 from ..pipeline_utils import DiffusionPipeline
+from .phase_lock import PhaseLockGuidance
 from .pipeline_output import AnyFlowPipelineOutput
 
 
@@ -405,6 +406,7 @@ class AnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         use_mean_velocity: bool = True,
+        phase_lock: Optional[PhaseLockGuidance] = None,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -473,6 +475,11 @@ class AnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 When `True`, the flow-map model is conditioned on both the source timestep `t` and the target timestep
                 `r` to predict a mean velocity, matching the training-time behavior. Disable to mirror raw Euler
                 stepping (`r = t`).
+            phase_lock ([`~pipelines.anyflow.phase_lock.PhaseLockGuidance`], *optional*):
+                Training-free PhaseLock guidance. When provided, the motion-prior phase captured from an early
+                denoising step is re-imposed on the per-step latent throughout the trajectory, mitigating the phase
+                erosion that degrades physical consistency of long-horizon generations. Negligible overhead and no
+                effect on the default `None` path.
 
         Examples:
 
@@ -568,6 +575,9 @@ class AnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         self.scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas, timesteps=timesteps)
         timesteps = self.scheduler.timesteps  # length N; `step` resolves the next sigma internally.
 
+        if phase_lock is not None:
+            phase_lock.reset()
+
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -609,6 +619,9 @@ class AnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                if phase_lock is not None:
+                    latents = phase_lock(latents, i, len(timesteps))
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

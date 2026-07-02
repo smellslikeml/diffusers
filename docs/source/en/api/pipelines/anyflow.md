@@ -167,6 +167,29 @@ export_to_video(video, "anyflow_far_v2v.mp4", fps=16)
 </hfoption>
 </hfoptions>
 
+### Locking motion priors with PhaseLock
+
+`AnyFlowPipeline.__call__` accepts an optional `phase_lock` argument that mitigates the loss of physical consistency in longer denoising trajectories. It implements PhaseLock from [Physics in 2-Steps: Locking Motion Priors Before Visual Refinement Erases Them](https://arxiv.org/abs/2606.06361): the *phase* of the latent spectrum carries the physically-consistent motion prior and erodes over many steps, while the *magnitude* (visual fidelity) stays stable. `PhaseLockGuidance` snapshots the phase from an early, few-step latent and re-imposes it on the per-step latent throughout the rest of the trajectory. It is training-free, has negligible overhead, and leaves the default (`phase_lock=None`) path unchanged.
+
+```py
+import torch
+from diffusers import AnyFlowPipeline
+from diffusers.pipelines.anyflow import PhaseLockGuidance
+from diffusers.utils import export_to_video
+
+pipe = AnyFlowPipeline.from_pretrained(
+    "nvidia/AnyFlow-Wan2.1-T2V-1.3B-Diffusers", torch_dtype=torch.bfloat16
+).to("cuda")
+
+# Capture the motion prior after 2 steps, then lock its low-frequency phase onto the
+# high-fidelity latents. `freq_cutoff_ratio` keeps fine appearance detail untouched.
+phase_lock = PhaseLockGuidance(prior_step=1, lock_strength=0.5, freq_cutoff_ratio=0.25)
+
+prompt = "A red panda eating bamboo in a forest, cinematic lighting"
+video = pipe(prompt, num_inference_steps=50, num_frames=81, phase_lock=phase_lock).frames[0]
+export_to_video(video, "anyflow_phase_lock.mp4", fps=16)
+```
+
 ## Notes
 
 - Classifier-free guidance is fused into the released checkpoints, so inference does not run a second guided forward pass. Keep the default `guidance_scale=1.0` unless your own checkpoint requires otherwise.
