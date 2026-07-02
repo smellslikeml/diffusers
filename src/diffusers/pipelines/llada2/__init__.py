@@ -22,6 +22,7 @@ except OptionalDependencyNotAvailable:
 
     _dummy_objects.update(get_objects_from_module(dummy_torch_and_transformers_objects))
 else:
+    _import_structure["logit_guidance"] = ["RewardLogitGuidance"]
     _import_structure["pipeline_llada2"] = ["LLaDA2Pipeline", "LLaDA2PipelineOutput"]
 
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
@@ -32,6 +33,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
     except OptionalDependencyNotAvailable:
         from ...utils.dummy_torch_and_transformers_objects import *  # noqa F403
     else:
+        from .logit_guidance import RewardLogitGuidance
         from .pipeline_llada2 import LLaDA2Pipeline, LLaDA2PipelineOutput
 else:
     import sys
