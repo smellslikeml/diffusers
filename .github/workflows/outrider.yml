@@ -62,7 +62,7 @@ jobs:
           if [ -n "$MODEL_INPUT" ]; then
             echo "ANTHROPIC_MODEL=$MODEL_INPUT" >> "$GITHUB_ENV"
           fi
-      - uses: remyxai/outrider@v1
+      - uses: remyxai/outrider@feat/adapted-fidelity
         with:
           interest-id: 6998975a-5301-43f0-bb61-9560ad933cb0
           rate-limit-days: '0'
