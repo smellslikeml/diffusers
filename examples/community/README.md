@@ -5633,7 +5633,7 @@ result.images[0].save(f"flux_fill_controlnet_inpaint_depth{timestamp}.jpg")
 
 ## Flux HRDiT
 
-Training-free high-resolution (up to 4096x4096) text-to-image generation with off-the-shelf Flux models, adapted from [HRDiT](https://arxiv.org/abs/2608.07003) ([official implementation](https://github.com/zylwithxy/HRDiT)). No fine-tuning and no new weights: the pipeline adds Spatial Position Alignment (position ids wrapped into the trained RoPE window and averaged over sliding bundle variants), optional head-adaptive attention pruning via FlexAttention, and a progressive 1024 -> 2048 -> 4096 generation ladder on top of the stock `FluxPipeline` denoise loop.
+Training-free high-resolution (up to 4096x4096) text-to-image generation with off-the-shelf Flux models, adapted from [HRDiT](https://arxiv.org/abs/2608.07003) ([official implementation](https://github.com/zylwithxy/HRDiT)). No fine-tuning and no new weights. On top of the stock `FluxPipeline` denoise loop it adds, per upscale stage: **NTK-aware RoPE scaling** (the RoPE base is scaled per stage so out-of-range high-resolution positions fall back into the trained band — the primary high-res mechanism); **Spatial Position Alignment (SPA)** on the leading steps (position ids monotonically coarsened into the trained window and averaged over sliding bundle variants inside attention); and a **structure-guided progressive 1024 -> 2048 -> 4096 ladder** (each stage decodes, upscales and re-encodes the previous latent as a structural prior, then injects its low-frequency band each step to prevent high-resolution drift). The default arguments reproduce the reference configuration.
 
 ```py
 import torch
@@ -5647,9 +5647,8 @@ image = pipe(
     "a photo of a mountain lake at dawn",
     height=4096,
     width=4096,
-    num_inference_steps=28,
-    group_num=4,  # number of SPA bundle variants averaged per step
-    use_hap=True,  # falls back to full attention if FlexAttention (torch >= 2.7) is unavailable
 ).images[0]
 image.save("hrdit_4096.png")
 ```
+
+Key arguments (all optional, defaulting to the reference configuration): `ntk_factor` (per-stage RoPE-base multiplier, default `[4.0, 10.0]`), `spa_steps` (leading SPA steps per stage, default `[3, 0]`), `group_num` (SPA bundle granularity, default `80`), `alphas`/`betas` (structure-guidance weights, default `[1.0, 0.25]`/`[0.5, 0.5]`), and `guidance_scale_highres` (default `[4.5, 6.0]`). A 4096x4096 generation runs in ~2 min at ~26 GB peak on an A100-80GB.
