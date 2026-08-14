@@ -495,9 +495,8 @@ class HRDiTFluxPipeline(FluxPipeline):
                     noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=dtype)
                     latents = (1.0 - start_sigma) * latents + start_sigma * noise
 
-                with self.progress_bar(
-                    total=len(timesteps), desc=f"HRDiT {stage_width}x{stage_height}"
-                ) as progress_bar:
+                self.set_progress_bar_config(desc=f"HRDiT {stage_width}x{stage_height}")
+                with self.progress_bar(total=len(timesteps)) as progress_bar:
                     for t in timesteps:
                         self._current_timestep = t
                         timestep = t.expand(latents.shape[0]).to(latents.dtype)
