@@ -10,6 +10,7 @@
 # specific language governing permissions and limitations under the License.
 
 import importlib.util
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -38,74 +39,84 @@ hrdit = _load_module("pipeline_flux_hrdit", PIPELINE_PATH)
 
 
 class BuildBundleIdVariantsTests(unittest.TestCase):
-    def test_single_variant_at_trained_resolution(self):
-        # Below the trained 64x64 packed grid, SPA must reduce to the stock Flux position ids.
-        variants = hrdit.build_bundle_id_variants(32, 64, bundle_size=64, group_num=4)
+    def _image_ids(self, grid_h, grid_w):
+        return FluxPipeline._prepare_latent_image_ids(1, grid_h, grid_w, torch.device("cpu"), torch.float32)
 
-        self.assertEqual(len(variants), 1)
-        expected = FluxPipeline._prepare_latent_image_ids(1, 32, 64, None, None)
-        self.assertTrue(torch.equal(variants[0], expected))
+    def test_variant_count_and_shape(self):
+        # group_num controls the bundle size s = ceil(max_index / (group_num - 1)); there are
+        # s_row + s_col - 1 sliding-boundary variants.
+        grid_h, grid_w, group_num = 128, 128, 80
+        ids = self._image_ids(grid_h, grid_w)
+        variants = hrdit.build_bundle_id_variants(ids, group_num)
 
-    def test_variants_wrap_into_trained_window(self):
-        variants = hrdit.build_bundle_id_variants(128, 96, bundle_size=64, group_num=4)
+        s = max(1, math.ceil((grid_h - 1) / (group_num - 1)))
+        self.assertEqual(len(variants), 2 * s - 1)
+        for v in variants:
+            self.assertEqual(v.shape, (grid_h * grid_w, 3))
 
-        self.assertEqual(len(variants), 4)
-        for variant in variants:
-            self.assertEqual(variant.shape, (128 * 96, 3))
-            self.assertLessEqual(variant[:, 1].max().item(), 63)
-            self.assertLessEqual(variant[:, 2].max().item(), 63)
-        for i in range(4):
-            for j in range(i + 1, 4):
-                self.assertFalse(torch.equal(variants[i], variants[j]))
+    def test_coarsened_ids_stay_in_trained_window(self):
+        # The whole point of SPA: even at 256x256 (a 4096 image) coarsened positions stay in range.
+        ids = self._image_ids(256, 256)
+        for v in hrdit.build_bundle_id_variants(ids, 80):
+            self.assertLessEqual(v[:, 1].max().item(), 64)
+            self.assertLessEqual(v[:, 2].max().item(), 64)
 
-    def test_first_variant_is_unshifted_partition(self):
-        variants = hrdit.build_bundle_id_variants(128, 64, bundle_size=64, group_num=4)
+    def test_mapping_is_monotonic_non_decreasing(self):
+        # A monotonic (non-wrapping) coarsening -> no periodic tiling.
+        grid = 128
+        ids = self._image_ids(grid, grid)
+        rows = hrdit.build_bundle_id_variants(ids, 80)[0][:, 1].reshape(grid, grid)
+        self.assertTrue(bool((rows[1:] >= rows[:-1]).all()))
 
-        ys = (torch.arange(128) % 64).repeat_interleave(64)
-        self.assertTrue(torch.equal(variants[0][:, 1], ys.to(variants[0].dtype)))
-
-
-class UpsamplePackedLatentsTests(unittest.TestCase):
-    def test_upsample_shape(self):
-        latents = torch.randn(2, 16 * 16, 64)
-        upsampled = hrdit.upsample_packed_latents(latents, (16, 16), (32, 32))
-
-        self.assertEqual(upsampled.shape, (2, 32 * 32, 64))
-
-    def test_upsample_is_identity_at_same_grid(self):
-        latents = torch.randn(1, 8 * 8, 64)
-        upsampled = hrdit.upsample_packed_latents(latents, (8, 8), (8, 8))
-
-        self.assertTrue(torch.allclose(upsampled, latents, atol=1e-5))
+    def test_group_num_below_two_raises(self):
+        ids = self._image_ids(128, 128)
+        with self.assertRaises(ValueError):
+            hrdit.build_bundle_id_variants(ids, 1)
 
 
-class HeadScopeTests(unittest.TestCase):
-    def test_scope_plan_round_robin(self):
-        plan = hrdit.build_head_scope_plan(24, window=64, full_period=4)
+class FluxRopeTests(unittest.TestCase):
+    axes_dim = [16, 56, 56]
 
-        self.assertEqual(plan.shape, (24,))
-        self.assertEqual((plan == -1).sum().item(), 6)
-        self.assertEqual((plan == 64).sum().item(), 18)
+    def test_shape(self):
+        ids = torch.zeros(20, 3)
+        cos, sin = hrdit.flux_rope(ids, self.axes_dim, 10000.0, ntk_factor=1.0)
+        self.assertEqual(cos.shape, (20, sum(self.axes_dim)))
+        self.assertEqual(sin.shape, (20, sum(self.axes_dim)))
 
-    def test_mask_mod_respects_scopes(self):
-        grid_height, grid_width, num_txt = 8, 8, 16
-        num_img = grid_height * grid_width
-        pos_h = torch.div(torch.arange(num_img), grid_width, rounding_mode="floor")
-        pos_w = torch.arange(num_img) % grid_width
-        windows = hrdit.build_head_scope_plan(8, window=2, full_period=4)
-        mask_mod = hrdit.build_mask_mod(pos_h, pos_w, windows, num_txt)
+    def test_zero_position_is_identity_rotation(self):
+        # Position 0 -> no rotation: cos == 1, sin == 0.
+        ids = torch.zeros(4, 3)
+        cos, sin = hrdit.flux_rope(ids, self.axes_dim, 10000.0)
+        self.assertTrue(torch.allclose(cos, torch.ones_like(cos), atol=1e-5))
+        self.assertTrue(torch.allclose(sin, torch.zeros_like(sin), atol=1e-5))
 
-        windowed_head = 1
-        full_head = 0
-        image_query = torch.tensor(num_txt)  # grid position (0, 0)
-        near_key = torch.tensor(num_txt + 1)  # grid position (0, 1)
-        far_key = torch.tensor(num_txt + 3 * grid_width)  # grid position (3, 0)
-        text_key = torch.tensor(3)
+    def test_ntk_scaling_lowers_rotation(self):
+        # Larger ntk_factor -> lower frequencies -> less rotation at the same position.
+        ids = torch.zeros(8, 3)
+        ids[:, 1] = torch.arange(8)
+        cos1, _ = hrdit.flux_rope(ids, self.axes_dim, 10000.0, ntk_factor=1.0)
+        cos10, _ = hrdit.flux_rope(ids, self.axes_dim, 10000.0, ntk_factor=10.0)
+        self.assertLess((cos10[7] - 1).abs().mean().item(), (cos1[7] - 1).abs().mean().item())
 
-        self.assertTrue(bool(mask_mod(0, windowed_head, image_query, text_key)))
-        self.assertTrue(bool(mask_mod(0, windowed_head, image_query, near_key)))
-        self.assertFalse(bool(mask_mod(0, windowed_head, image_query, far_key)))
-        self.assertTrue(bool(mask_mod(0, full_head, image_query, far_key)))
+
+class StructureGuidanceHelperTests(unittest.TestCase):
+    def test_butterworth_low_pass_shape_and_profile(self):
+        mask = hrdit.butterworth_low_pass_filter_2d(64, 64, 0.2, torch.device("cpu"))
+        self.assertEqual(mask.shape, (1, 1, 64, 64))
+        self.assertGreater(mask[0, 0, 32, 32].item(), 0.9)  # passband at the center
+        self.assertLess(mask[0, 0, 0, 0].item(), 0.1)  # stopband at the corner
+
+    def test_butterworth_zero_ratio_is_all_zeros(self):
+        mask = hrdit.butterworth_low_pass_filter_2d(16, 16, 0.0, torch.device("cpu"))
+        self.assertTrue(torch.equal(mask, torch.zeros_like(mask)))
+
+    def test_split_low_freq_reduces_variance(self):
+        mask = hrdit.butterworth_low_pass_filter_2d(32, 32, 0.2, torch.device("cpu"))
+        x = torch.randn(1, 4, 32, 32)
+        low = hrdit.split_low_freq(x, mask)
+        self.assertEqual(low.shape, x.shape)
+        self.assertFalse(low.is_complex())
+        self.assertLess(low.var().item(), x.var().item())
 
 
 class PipelineIntegrationTests(unittest.TestCase):
@@ -119,7 +130,10 @@ class PipelineIntegrationTests(unittest.TestCase):
         benchmark = _load_module(
             "benchmarking_flux_hrdit", BENCHMARKS_DIR / "benchmarking_flux_hrdit.py", extra_sys_path=BENCHMARKS_DIR
         )
-
         self.assertEqual(benchmark.RESULT_FILENAME, "flux_hrdit.csv")
         self.assertEqual(benchmark.CKPT_ID, "black-forest-labs/FLUX.1-dev")
         self.assertTrue(callable(benchmark.run_benchmarks))
+
+
+if __name__ == "__main__":
+    unittest.main()
