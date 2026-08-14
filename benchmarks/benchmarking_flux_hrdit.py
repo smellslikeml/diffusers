@@ -14,7 +14,6 @@ import argparse
 from pathlib import Path
 
 import torch
-
 from benchmarking_utils import benchmark_fn, flush
 
 from diffusers import FluxPipeline
@@ -46,9 +45,9 @@ def run_benchmarks(height, width, num_inference_steps):
 
     settings = {
         # Naive: generate straight at the target resolution in one pass (stock FluxPipeline).
-        "naive": (naive_pipe, dict(height=height, width=width, num_inference_steps=num_inference_steps)),
+        "naive": (naive_pipe, {"height": height, "width": width, "num_inference_steps": num_inference_steps}),
         # HRDiT: NTK RoPE + SPA + structure-guided progressive ladder up to the target resolution.
-        "hrdit": (hrdit_pipe, dict(height=height, width=width, num_inference_steps=num_inference_steps)),
+        "hrdit": (hrdit_pipe, {"height": height, "width": width, "num_inference_steps": num_inference_steps}),
     }
 
     results = []
