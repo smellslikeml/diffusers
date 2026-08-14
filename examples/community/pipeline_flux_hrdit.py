@@ -264,7 +264,8 @@ class HRDiTFluxPipeline(FluxPipeline):
     Training-free high-resolution (up to 4096x4096) text-to-image with off-the-shelf Flux models.
 
     Adapted from HRDiT, "Training-Free High-Resolution Image Generation with Off-the-Shelf Diffusion Transformer
-    Models" (https://arxiv.org/abs/2608.07003); reference implementation at https://github.com/zylwithxy/HRDiT.
+    Models" (https://arxiv.org/abs/2608.07003); MIT-licensed reference implementation at
+    https://github.com/zylwithxy/HRDiT.
 
     Training-free pieces on top of the stock `FluxPipeline` denoise loop:
 
