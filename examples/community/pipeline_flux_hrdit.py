@@ -9,7 +9,8 @@
 # an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 # specific language governing permissions and limitations under the License.
 
-from typing import Any, Callable, Dict, List, Optional, Union
+import math
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -23,15 +24,10 @@ from diffusers.utils import logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 
 
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-
-    FLEX_ATTENTION_AVAILABLE = True
-except ImportError:
-    FLEX_ATTENTION_AVAILABLE = False
-
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+# FLUX is trained at 1024x1024 -> a 64x64 packed grid (4096 image tokens) plus 512 text tokens.
+_TRAIN_SEQ_LEN = 64 ** 2 + 512
 
 EXAMPLE_DOC_STRING = """
     Examples:
@@ -55,54 +51,51 @@ EXAMPLE_DOC_STRING = """
 # ---------------------------------------------------------------------------------------
 
 
-def build_bundle_id_variants(
-    height: int,
-    width: int,
-    bundle_size: int = 64,
-    group_num: int = 4,
-    device=None,
-    dtype=None,
-) -> List[torch.Tensor]:
+def _phi(x: torch.Tensor, n1: int, size: int) -> torch.Tensor:
+    """Bundle mapping: 0 for x < n1, else ceil((x + 1 - n1) / size). Monotonic non-decreasing."""
+    return torch.where(x < n1, torch.zeros_like(x), (x + 1 - n1 + size - 1) // size)
+
+
+def build_bundle_id_variants(img_ids: torch.Tensor, group_num: int) -> List[torch.Tensor]:
     """
-    Spatial Position Alignment (SPA) position ids for a packed latent grid of `height` x `width` tokens.
+    Spatial Position Alignment (SPA) bundle-index variants of the packed-latent position ids ``img_ids``.
 
-    Off-the-shelf Flux models are trained at 1024x1024, i.e. a 64x64 packed latent grid, so the rotary position
-    ids never exceed 64 during training. Generating at higher resolutions produces out-of-range positions, which
-    manifests as the "spatial disorder" artifacts described in the HRDiT paper.
+    Off-the-shelf FLUX is trained on a 64x64 packed grid, so its rotary position ids never exceed ~64. Generating
+    at higher resolution pushes ids out of the trained range, which is the "spatial disorder" the HRDiT paper
+    describes. SPA maps each token's grid coordinate into a small number of *bundles* via a monotonic (non-wrapping)
+    coarsening ``_phi`` -- many neighbouring tokens then share a position id inside the trained range. Because the
+    mapping is monotonic it introduces no periodic tiling; the residual bundle-boundary seams are averaged out by
+    sliding the boundary origin across ``group_num`` variants (see [`HRDiTFluxAttnProcessor`], which averages the
+    per-variant attention outputs -- element-wise identical to averaging the attention maps, at O(T*D) memory).
 
-    SPA remaps every token's absolute grid coordinate into the trained RoPE window by wrapping it into sliding
-    `bundle_size` bundles. A single bundle partition would introduce seams at the bundle boundaries, so `group_num`
-    partitions with shifted origins ("bundle variants") are produced; the pipeline averages the transformer output
-    over the variants, which removes the seams.
-
-    Adapted from HRDiT (https://arxiv.org/abs/2608.07003), `hrdit/spa.py::build_bundle_id_variants`. At or below
-    the trained resolution a single variant equal to the stock `FluxPipeline` ids is returned.
+    Adapted from HRDiT (https://arxiv.org/abs/2608.07003), ``hrdit/spa.py::build_bundle_id_variants``.
 
     Args:
-        height (`int`): Packed latent grid height (pixels / 16).
-        width (`int`): Packed latent grid width (pixels / 16).
-        bundle_size (`int`, defaults to 64): Side length of one bundle, i.e. the trained packed grid size.
-        group_num (`int`, defaults to 4): Number of sliding bundle variants.
-        device, dtype: Placed on / cast to the latent dtype, matching `_prepare_latent_image_ids`.
+        img_ids (`torch.Tensor`): Packed-latent position ids of shape `(T, 3)`; column 1 is the row index and
+            column 2 the column index (as produced by `FluxPipeline._prepare_latent_image_ids`).
+        group_num (`int`): Controls the bundle size `ceil(max_index / (group_num - 1))`; larger values give finer
+            bundles (more distinct positions, kept inside the trained window). Must be >= 2.
 
     Returns:
-        `List[torch.Tensor]` of shape `(height * width, 3)` each, one per bundle variant.
+        `List[torch.Tensor]` of shape `(T, 3)` each, one per sliding bundle-boundary variant.
     """
-    if height <= bundle_size and width <= bundle_size:
-        return [FluxPipeline._prepare_latent_image_ids(1, height, width, device, dtype)]
+    if group_num < 2:
+        raise ValueError(f"`group_num` must be >= 2 for SPA, got {group_num}.")
 
-    variants = []
-    ys = torch.arange(height, device=device)
-    xs = torch.arange(width, device=device)
-    for variant in range(group_num):
-        # Slide the bundle partition origin; wrap coordinates into the trained RoPE window.
-        shift = (variant * bundle_size) // group_num
-        variant_ys = ((ys - shift) % height % bundle_size).to(dtype)
-        variant_xs = ((xs - shift) % width % bundle_size).to(dtype)
-        ids = torch.zeros(height, width, 3, device=device, dtype=dtype)
-        ids[..., 1] = variant_ys[:, None]
-        ids[..., 2] = variant_xs[None, :]
-        variants.append(ids.reshape(height * width, 3))
+    rows = img_ids[:, 1].long()
+    cols = img_ids[:, 2].long()
+    s_row = max(1, math.ceil(rows.max().item() / (group_num - 1)))
+    s_col = max(1, math.ceil(cols.max().item() / (group_num - 1)))
+
+    def variant(n1_row: int, n1_col: int) -> torch.Tensor:
+        ids = img_ids.clone()
+        ids[:, 1] = _phi(rows, n1_row, s_row).to(img_ids.dtype)
+        ids[:, 2] = _phi(cols, n1_col, s_col).to(img_ids.dtype)
+        return ids
+
+    variants = [variant(s_row, s_col)]
+    variants += [variant(n, s_col) for n in range(1, s_row)]
+    variants += [variant(s_row, m) for m in range(1, s_col)]
     return variants
 
 
@@ -129,112 +122,46 @@ def upsample_packed_latents(latents: torch.Tensor, old_grid: tuple, new_grid: tu
 
 
 # ---------------------------------------------------------------------------------------
-# HAP: Head-adaptive Attention Pruning
+# SPA attention processor (averaging happens *inside* attention)
 # ---------------------------------------------------------------------------------------
 
 
-def build_head_scope_plan(num_heads: int, window: int = 64, full_period: int = 4) -> torch.Tensor:
+class _SPAState:
     """
-    Per-head attention scope plan for HAP as an int64 tensor of length `num_heads`.
+    Module-level carrier for the current SPA rotary-embedding variants.
 
-    An entry of `-1` gives the head full (global) scope; a positive entry is the head's window radius in packed
-    latent-grid cells. Heads keep text keys inside their scope regardless.
-
-    The paper reads a per-head scope plan from `configs/scope_plan_flux.json`; the checkpoint-specific plan is not
-    redistributable here, so this deterministic round-robin plan (every `full_period`-th head global, the rest
-    windowed) substitutes for it.
-    """
-    plan = torch.full((num_heads,), window, dtype=torch.long)
-    plan[::full_period] = -1
-    return plan
-
-
-def build_mask_mod(pos_h: torch.Tensor, pos_w: torch.Tensor, windows: torch.Tensor, num_txt: int) -> Callable:
-    """
-    Build a `flex_attention` mask_mod implementing the per-head scopes of HAP.
-
-    `pos_h` / `pos_w` map an image token index to its packed grid coordinates; `windows` is the output of
-    [`build_head_scope_plan`]. Text keys and text queries always stay in scope.
-    """
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        window = windows[h]
-        text_query = q_idx < num_txt
-        text_key = kv_idx < num_txt
-        img_kv = (kv_idx - num_txt).clamp(min=0)
-        img_q = (q_idx - num_txt).clamp(min=0)
-        row_dist = (pos_h[img_q] - pos_h[img_kv]).abs()
-        col_dist = (pos_w[img_q] - pos_w[img_kv]).abs()
-        return (window < 0) | text_query | text_key | ((row_dist <= window) & (col_dist <= window))
-
-    return mask_mod
-
-
-class _HeadScopeState:
-    """
-    Carries the current HAP scope plan and packed grid between the pipeline and the attention processors.
-
-    The transformer blocks share one processor instance and do not see the grid directly, so the pipeline arms
-    this module-level state around the denoising loop and the processors read from it.
+    The transformer blocks share one processor instance and are not aware of SPA, so the pipeline precomputes the
+    per-variant rotary embeddings once per stage and arms them here; every processor reads from this state.
     """
 
     def __init__(self):
-        self.windows = None
-        self.grid_height = 0
-        self.grid_width = 0
-        self._block_masks: Dict[tuple, Any] = {}
+        self.rope_variants = None  # List[(cos, sin)] covering the full [text; image] sequence
+        self.proportional = True
 
     @property
     def enabled(self):
-        return self.windows is not None
+        return self.rope_variants is not None
 
-    def arm(self, windows: torch.Tensor):
-        self.windows = windows
-        self._block_masks = {}
-
-    def set_grid(self, grid_height: int, grid_width: int):
-        self.grid_height = grid_height
-        self.grid_width = grid_width
-        self._block_masks = {}
+    def arm(self, rope_variants):
+        self.rope_variants = rope_variants
 
     def disarm(self):
-        self.windows = None
-        self._block_masks = {}
-
-    def get_block_mask(self, seq_len: int, num_txt: int, device):
-        key = (seq_len, num_txt, device)
-        if key in self._block_masks:
-            return self._block_masks[key]
-
-        num_img = seq_len - num_txt
-        pos_h = torch.div(torch.arange(num_img, device=device), self.grid_width, rounding_mode="floor")
-        pos_w = torch.arange(num_img, device=device) % self.grid_width
-        mask_mod = build_mask_mod(pos_h, pos_w, self.windows.to(device), num_txt)
-        block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device)
-        self._block_masks[key] = block_mask
-        return block_mask
+        self.rope_variants = None
 
 
-_HAP_STATE = _HeadScopeState()
-
-# flex_attention must be compiled to generate a fused, block-sparse kernel; the eager path
-# materializes the full (B, H, S, S) score matrix and OOMs at high resolution.
-_FLEX_ATTENTION_COMPILED = None
-
-
-def _compiled_flex_attention():
-    global _FLEX_ATTENTION_COMPILED
-    if _FLEX_ATTENTION_COMPILED is None:
-        _FLEX_ATTENTION_COMPILED = torch.compile(flex_attention, dynamic=False)
-    return _FLEX_ATTENTION_COMPILED
+_SPA_STATE = _SPAState()
 
 
 class HRDiTFluxAttnProcessor(FluxAttnProcessor):
     """
-    Flux attention processor with head-adaptive attention pruning (HAP).
+    Flux attention processor implementing HRDiT's Spatial Position Alignment (SPA).
 
-    Only the joint (double) blocks — the calls that pass `encoder_hidden_states` — take the pruned path; the
-    single blocks fall back to the stock processor, and so does everything when FlexAttention is unavailable.
+    When SPA is armed (via [`_SPAState`]) the processor ignores the transformer's own rotary embedding and instead
+    runs attention once per bundle-index variant -- applying that variant's RoPE to the query/key -- then averages
+    the attention *outputs*. Since `mean_n(softmax(A_n)) @ V == mean_n(softmax(A_n) @ V)`, averaging the outputs is
+    element-wise identical to the paper's average-over-attention-maps, at O(T*D) memory instead of O(V*T^2). A
+    proportional attention scale ``sqrt(log_train(seq_len) / head_dim)`` compensates for the longer high-resolution
+    sequence. When SPA is disarmed the processor is exactly the stock `FluxAttnProcessor`.
     """
 
     def __call__(
@@ -245,11 +172,9 @@ class HRDiTFluxAttnProcessor(FluxAttnProcessor):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb=None,
     ) -> torch.Tensor:
-        if not (_HAP_STATE.enabled and FLEX_ATTENTION_AVAILABLE) or encoder_hidden_states is None:
+        if not _SPA_STATE.enabled:
             return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb)
-        return self._scoped_attention(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
 
-    def _scoped_attention(self, attn, hidden_states, encoder_hidden_states, image_rotary_emb):
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -260,38 +185,44 @@ class HRDiTFluxAttnProcessor(FluxAttnProcessor):
         query = attn.norm_q(query)
         key = attn.norm_k(key)
 
-        encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
-        encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
-        encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
-        encoder_query = attn.norm_added_q(encoder_query)
-        encoder_key = attn.norm_added_k(encoder_key)
+        if encoder_hidden_states is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
 
-        query = torch.cat([encoder_query, query], dim=1)
-        key = torch.cat([encoder_key, key], dim=1)
-        value = torch.cat([encoder_value, value], dim=1)
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
 
-        if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+        head_dim = query.shape[-1]
+        seq_len = query.shape[1]
+        if _SPA_STATE.proportional and seq_len > 1:
+            scale = math.sqrt(math.log(seq_len, _TRAIN_SEQ_LEN) / head_dim)
+        else:
+            scale = head_dim ** -0.5
 
-        num_txt = encoder_hidden_states.shape[1]
-        block_mask = _HAP_STATE.get_block_mask(key.shape[1], num_txt, query.device)
-        hidden_states = _compiled_flex_attention()(
-            query.transpose(1, 2).contiguous(),
-            key.transpose(1, 2).contiguous(),
-            value.transpose(1, 2).contiguous(),
-            block_mask=block_mask,
-        ).transpose(1, 2)
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
+        value_t = value.transpose(1, 2).contiguous()  # [B, H, S, D]
+        acc = None
+        for rope_variant in _SPA_STATE.rope_variants:
+            query_v = apply_rotary_emb(query, rope_variant, sequence_dim=1).transpose(1, 2).contiguous()
+            key_v = apply_rotary_emb(key, rope_variant, sequence_dim=1).transpose(1, 2).contiguous()
+            out = F.scaled_dot_product_attention(query_v, key_v, value_t, dropout_p=0.0, is_causal=False, scale=scale)
+            acc = out if acc is None else acc + out
+        hidden_states = (acc / len(_SPA_STATE.rope_variants)).transpose(1, 2)  # [B, S, H, D]
+        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
 
-        text_hidden_states, image_hidden_states = hidden_states.split_with_sizes(
-            [num_txt, hidden_states.shape[1] - num_txt], dim=1
-        )
-        image_hidden_states = attn.to_out[0](image_hidden_states.contiguous())
-        image_hidden_states = attn.to_out[1](image_hidden_states)
-        text_hidden_states = attn.to_add_out(text_hidden_states.contiguous())
-        return image_hidden_states, text_hidden_states
+        if encoder_hidden_states is not None:
+            num_txt = encoder_hidden_states.shape[1]
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [num_txt, hidden_states.shape[1] - num_txt], dim=1
+            )
+            hidden_states = attn.to_out[0](hidden_states.contiguous())
+            hidden_states = attn.to_out[1](hidden_states)
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states.contiguous())
+            return hidden_states, encoder_hidden_states
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------------------
@@ -306,28 +237,29 @@ class HRDiTFluxPipeline(FluxPipeline):
     Adapted from HRDiT, "Training-Free High-Resolution Image Generation with Off-the-Shelf Diffusion Transformer
     Models" (https://arxiv.org/abs/2608.07003); reference implementation at https://github.com/zylwithxy/HRDiT.
 
-    Three training-free pieces on top of the stock `FluxPipeline` denoise loop:
+    Two training-free pieces on top of the stock `FluxPipeline` denoise loop:
 
-    - **SPA (Spatial Position Alignment)** — `build_bundle_id_variants` wraps high-resolution rotary position ids
-      into the trained 64x64 window across `group_num` sliding bundle variants; the transformer output is averaged
-      over the variants. The paper averages attention inside each attention layer; this pipeline averages at the
-      transformer output, which keeps the stock `FluxTransformer2DModel` untouched and needs no custom processor.
-    - **HAP (Head-adaptive Attention Pruning)** — `HRDiTFluxAttnProcessor` prunes attention outside each head's
-      scope via FlexAttention (torch >= 2.7). The paper's checkpoint-specific scope plan file is replaced by the
-      deterministic `build_head_scope_plan`; if FlexAttention is unavailable the processor falls back to full
-      attention and SPA alone remains active.
-    - **Progressive generation** — denoising climbs a resolution ladder (1024 -> 2048 -> 4096 by default), with the
-      previous stage's latent bilinearly upsampled and re-noised at the next stage's starting sigma.
+    - **SPA (Spatial Position Alignment)** -- `build_bundle_id_variants` maps high-resolution rotary position ids
+      into the trained ~64x64 window via a monotonic bundle coarsening (no wrapping, so no periodic tiling), across
+      several sliding bundle-boundary variants. `HRDiTFluxAttnProcessor` runs attention once per variant and averages
+      the outputs, with a proportional attention scale for the longer sequence. This is the core training-free fix
+      for high-resolution "spatial disorder".
+    - **Progressive generation** -- denoising climbs a resolution ladder (1024 -> 2048 -> 4096 by default); each
+      stage bilinearly upsamples the previous stage's latent and re-noises it through the tail of the schedule. SPA
+      is active only on the upscale stages (the base stage is in-distribution and uses stock RoPE).
+
+    Not ported from the reference (documented follow-ups): the checkpoint-specific HAP head-scope pruning
+    (`configs/scope_plan_flux.json`), NTK-aware RoPE scaling, and per-step SPA scheduling. SPA here runs on every
+    step of every upscale stage and on every attention block.
 
     Args:
         prompt (`str` or `List[str]`): The prompt to render.
         height / width (`int`): Final output resolution. Defaults to 1024.
         resolutions (`List[int]`, optional): Progressive resolution ladder (square side lengths). Defaults to
             doubling from 1024 up to the target resolution.
-        group_num (`int`, defaults to 4): Number of SPA bundle variants averaged per step.
-        bundle_size (`int`, defaults to 64): Trained packed latent grid side (1024px for Flux).
-        use_hap (`bool`, defaults to True): Enable head-adaptive attention pruning when FlexAttention is available.
-        hap_window (`int`, defaults to 64): Window radius (packed grid cells) of the windowed heads.
+        group_num (`int`, defaults to 80): SPA bundle granularity; bundle size is `ceil(max_index / (group_num - 1))`.
+            Larger keeps more distinct positions inside the trained window. `group_num - 1` also bounds the number of
+            averaged variants.
         stage_strength (`float`, defaults to 0.6): Fraction of the schedule each upsampled stage re-noises through.
 
     Example: see `EXAMPLE_DOC_STRING`.
@@ -366,10 +298,7 @@ class HRDiTFluxPipeline(FluxPipeline):
         height: Optional[int] = None,
         width: Optional[int] = None,
         resolutions: Optional[List[int]] = None,
-        group_num: int = 4,
-        bundle_size: int = 64,
-        use_hap: bool = True,
-        hap_window: int = 64,
+        group_num: int = 80,
         stage_strength: float = 0.6,
         num_inference_steps: int = 28,
         guidance_scale: float = 3.5,
@@ -382,12 +311,11 @@ class HRDiTFluxPipeline(FluxPipeline):
         return_dict: bool = True,
         max_sequence_length: int = 512,
     ):
-        r"""Generate a high-resolution image, training-free, with HRDiT (SPA + optional HAP).
+        r"""Generate a high-resolution image, training-free, with HRDiT (SPA + progressive generation).
 
-        Accepts the standard [`FluxPipeline`] arguments plus SPA controls (`resolutions`,
-        `group_num`, `bundle_size`) and HAP / progressive-ladder controls (`use_hap`,
-        `hap_window`, `stage_strength`). `height` and `width` set the final resolution; the
-        pipeline renders progressively up to it.
+        Accepts the standard [`FluxPipeline`] arguments plus `resolutions` / `group_num` (SPA) and `stage_strength`
+        (progressive re-noising). `height` and `width` set the final resolution; the pipeline renders progressively
+        up to it.
 
         Examples:
         """
@@ -429,19 +357,9 @@ class HRDiTFluxPipeline(FluxPipeline):
 
         self._joint_attention_kwargs = {}
 
-        # 2. Optionally arm HAP.
-        original_attn_processors = None
-        if use_hap:
-            if FLEX_ATTENTION_AVAILABLE:
-                original_attn_processors = dict(self.transformer.attn_processors)
-                self.transformer.set_attn_processor(HRDiTFluxAttnProcessor())
-                num_heads = getattr(self.transformer.config, "num_attention_heads", 24)
-                _HAP_STATE.arm(build_head_scope_plan(num_heads, window=hap_window))
-            else:
-                logger.warning(
-                    "use_hap=True but FlexAttention is unavailable (needs torch >= 2.7); "
-                    "falling back to full attention. SPA stays active."
-                )
+        # 2. Install the SPA processor (armed per-stage below; disarmed => stock attention).
+        original_attn_processors = dict(self.transformer.attn_processors)
+        self.transformer.set_attn_processor(HRDiTFluxAttnProcessor())
 
         try:
             # 3. Progressive denoising over the resolution ladder.
@@ -481,12 +399,19 @@ class HRDiTFluxPipeline(FluxPipeline):
                     stage_sigmas = all_sigmas[-num_stage_steps:]
                 old_grid = (grid_height, grid_width)
 
-                image_id_variants = build_bundle_id_variants(
-                    grid_height, grid_width, bundle_size=bundle_size, group_num=group_num, device=device, dtype=dtype
-                )
+                image_ids = self._prepare_latent_image_ids(batch_size, grid_height, grid_width, device, dtype)
 
-                if _HAP_STATE.enabled:
-                    _HAP_STATE.set_grid(grid_height, grid_width)
+                # SPA on the upscale stages only: coarsen the out-of-range ids into the trained window and
+                # precompute the per-variant rotary embeddings over the full [text; image] sequence.
+                if grid_height > 64 or grid_width > 64:
+                    variants = build_bundle_id_variants(image_ids, group_num)
+                    rope_variants = [
+                        self.transformer.pos_embed(torch.cat([text_ids, variant_ids], dim=0))
+                        for variant_ids in variants
+                    ]
+                    _SPA_STATE.arm(rope_variants)
+                else:
+                    _SPA_STATE.disarm()
 
                 mu = calculate_shift(
                     grid_height * grid_width,
@@ -512,22 +437,18 @@ class HRDiTFluxPipeline(FluxPipeline):
                     for t in timesteps:
                         self._current_timestep = t
                         timestep = t.expand(latents.shape[0]).to(latents.dtype)
-                        noise_pred = None
-                        for image_ids in image_id_variants:
-                            with self.transformer.cache_context("cond"):
-                                variant_pred = self.transformer(
-                                    hidden_states=latents,
-                                    timestep=timestep / 1000,
-                                    guidance=guidance,
-                                    pooled_projections=pooled_prompt_embeds,
-                                    encoder_hidden_states=prompt_embeds,
-                                    txt_ids=text_ids,
-                                    img_ids=image_ids,
-                                    joint_attention_kwargs=self.joint_attention_kwargs,
-                                    return_dict=False,
-                                )[0]
-                            noise_pred = variant_pred if noise_pred is None else noise_pred + variant_pred
-                        noise_pred = noise_pred / len(image_id_variants)
+                        with self.transformer.cache_context("cond"):
+                            noise_pred = self.transformer(
+                                hidden_states=latents,
+                                timestep=timestep / 1000,
+                                guidance=guidance,
+                                pooled_projections=pooled_prompt_embeds,
+                                encoder_hidden_states=prompt_embeds,
+                                txt_ids=text_ids,
+                                img_ids=image_ids,
+                                joint_attention_kwargs=self.joint_attention_kwargs,
+                                return_dict=False,
+                            )[0]
                         latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
                         progress_bar.update()
 
@@ -543,9 +464,8 @@ class HRDiTFluxPipeline(FluxPipeline):
 
             self.maybe_free_model_hooks()
         finally:
-            if original_attn_processors is not None:
-                self.transformer.set_attn_processor(original_attn_processors)
-                _HAP_STATE.disarm()
+            _SPA_STATE.disarm()
+            self.transformer.set_attn_processor(original_attn_processors)
 
         if not return_dict:
             return (image,)
