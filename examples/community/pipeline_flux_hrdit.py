@@ -35,7 +35,7 @@ except ImportError:
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 # FLUX is trained at 1024x1024 -> a 64x64 packed grid (4096 image tokens) plus 512 text tokens.
-_TRAIN_SEQ_LEN = 64 ** 2 + 512
+_TRAIN_SEQ_LEN = 64**2 + 512
 
 EXAMPLE_DOC_STRING = """
     Examples:
@@ -114,7 +114,7 @@ def flux_rope(ids: torch.Tensor, axes_dim, theta: float, ntk_factor: float = 1.0
     for i, dim in enumerate(axes_dim):
         pos = ids[:, i].to(torch.float64)
         exps = torch.arange(0, dim, 2, dtype=torch.float64, device=ids.device)[: dim // 2] / dim
-        freqs = torch.outer(pos, 1.0 / (scaled_theta ** exps))  # [S, dim/2]
+        freqs = torch.outer(pos, 1.0 / (scaled_theta**exps))  # [S, dim/2]
         cos_out.append(freqs.cos().repeat_interleave(2, dim=1).float())
         sin_out.append(freqs.sin().repeat_interleave(2, dim=1).float())
     return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
@@ -126,8 +126,8 @@ def butterworth_low_pass_filter_2d(height: int, width: int, ratio: float, device
         return torch.zeros(1, 1, height, width, device=device)
     yy = (2.0 * torch.arange(height, device=device) / height - 1.0).view(height, 1)
     xx = (2.0 * torch.arange(width, device=device) / width - 1.0).view(1, width)
-    d_square = yy ** 2 + xx ** 2
-    mask = 1.0 / (1.0 + (d_square / ratio ** 2) ** order)
+    d_square = yy**2 + xx**2
+    mask = 1.0 / (1.0 + (d_square / ratio**2) ** order)
     return mask.view(1, 1, height, width)
 
 
@@ -229,7 +229,7 @@ class HRDiTFluxAttnProcessor(FluxAttnProcessor):
         if _SPA_STATE.proportional and seq_len > 1:
             scale = math.sqrt(math.log(seq_len, _TRAIN_SEQ_LEN) / head_dim)
         else:
-            scale = head_dim ** -0.5
+            scale = head_dim**-0.5
 
         value_t = value.transpose(1, 2).contiguous()  # [B, H, S, D]
         ropes = _SPA_STATE.current_ropes()
@@ -440,7 +440,6 @@ class HRDiTFluxPipeline(FluxPipeline):
 
         ladder = self._resolution_ladder(height, width, resolutions)
         target = max(height, width)
-        n_upscale = len(ladder) - 1
 
         ntk_schedule = ntk_factor if ntk_factor is not None else [4.0, 10.0]
         spa_schedule = spa_steps if spa_steps is not None else [3, 0]
