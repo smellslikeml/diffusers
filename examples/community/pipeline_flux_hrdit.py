@@ -217,6 +217,17 @@ class _HeadScopeState:
 
 _HAP_STATE = _HeadScopeState()
 
+# flex_attention must be compiled to generate a fused, block-sparse kernel; the eager path
+# materializes the full (B, H, S, S) score matrix and OOMs at high resolution.
+_FLEX_ATTENTION_COMPILED = None
+
+
+def _compiled_flex_attention():
+    global _FLEX_ATTENTION_COMPILED
+    if _FLEX_ATTENTION_COMPILED is None:
+        _FLEX_ATTENTION_COMPILED = torch.compile(flex_attention, dynamic=False)
+    return _FLEX_ATTENTION_COMPILED
+
 
 class HRDiTFluxAttnProcessor(FluxAttnProcessor):
     """
@@ -265,7 +276,7 @@ class HRDiTFluxAttnProcessor(FluxAttnProcessor):
 
         num_txt = encoder_hidden_states.shape[1]
         block_mask = _HAP_STATE.get_block_mask(key.shape[1], num_txt, query.device)
-        hidden_states = flex_attention(
+        hidden_states = _compiled_flex_attention()(
             query.transpose(1, 2).contiguous(),
             key.transpose(1, 2).contiguous(),
             value.transpose(1, 2).contiguous(),
@@ -346,6 +357,7 @@ class HRDiTFluxPipeline(FluxPipeline):
         stage_width = max(quant, int(round(width * side / target)) // quant * quant)
         return stage_height, stage_width
 
+    @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
