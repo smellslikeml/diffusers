@@ -370,6 +370,15 @@ class HRDiTFluxPipeline(FluxPipeline):
         return_dict: bool = True,
         max_sequence_length: int = 512,
     ):
+        r"""Generate a high-resolution image, training-free, with HRDiT (SPA + optional HAP).
+
+        Accepts the standard [`FluxPipeline`] arguments plus SPA controls (`resolutions`,
+        `group_num`, `bundle_size`) and HAP / progressive-ladder controls (`use_hap`,
+        `hap_window`, `stage_strength`). `height` and `width` set the final resolution; the
+        pipeline renders progressively up to it.
+
+        Examples:
+        """
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
         quant = self.vae_scale_factor * 2
