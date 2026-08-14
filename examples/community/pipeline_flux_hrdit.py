@@ -126,27 +126,58 @@ def upsample_packed_latents(latents: torch.Tensor, old_grid: tuple, new_grid: tu
 # ---------------------------------------------------------------------------------------
 
 
+def flux_rope(ids: torch.Tensor, axes_dim, theta: float, ntk_factor: float = 1.0):
+    """
+    Flux rotary embeddings for position ids ``ids`` [S, len(axes_dim)], with NTK-aware scaling.
+
+    Identical to diffusers' `FluxPosEmbed` at ``ntk_factor == 1``; NTK scaling multiplies the RoPE base ``theta`` by
+    ``ntk_factor`` (HRDiT ``hrdit/transformer.py::get_1d_rotary_pos_embed``), which lowers every frequency and thereby
+    compresses out-of-range high-resolution positions back into the trained band -- the primary training-free
+    high-resolution mechanism (SPA only augments the leading steps). Returns ``(cos, sin)`` each `[S, sum(axes_dim)]`.
+    """
+    scaled_theta = theta * ntk_factor
+    cos_out, sin_out = [], []
+    for i, dim in enumerate(axes_dim):
+        pos = ids[:, i].to(torch.float64)
+        exps = torch.arange(0, dim, 2, dtype=torch.float64, device=ids.device)[: dim // 2] / dim
+        freqs = torch.outer(pos, 1.0 / (scaled_theta ** exps))  # [S, dim/2]
+        cos_out.append(freqs.cos().repeat_interleave(2, dim=1).float())
+        sin_out.append(freqs.sin().repeat_interleave(2, dim=1).float())
+    return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
+
+
 class _SPAState:
     """
-    Module-level carrier for the current SPA rotary-embedding variants.
+    Module-level carrier for the current stage's rotary embeddings.
 
-    The transformer blocks share one processor instance and are not aware of SPA, so the pipeline precomputes the
-    per-variant rotary embeddings once per stage and arms them here; every processor reads from this state.
+    The transformer blocks share one processor instance and are not aware of SPA/NTK, so the pipeline precomputes the
+    rotary embeddings once per stage and arms them here; every processor reads from this state. ``base_rope`` is the
+    single NTK-scaled RoPE used on every step; ``variant_ropes`` are the SPA bundle variants used only while
+    ``spa_active`` is set (the leading steps of a stage). ``spa_active`` is toggled per denoising step.
     """
 
     def __init__(self):
-        self.rope_variants = None  # List[(cos, sin)] covering the full [text; image] sequence
+        self.base_rope = None  # (cos, sin) over the full [text; image] sequence
+        self.variant_ropes = None  # List[(cos, sin)] SPA bundle variants
+        self.spa_active = False
         self.proportional = True
 
     @property
     def enabled(self):
-        return self.rope_variants is not None
+        return self.base_rope is not None
 
-    def arm(self, rope_variants):
-        self.rope_variants = rope_variants
+    def arm(self, base_rope, variant_ropes):
+        self.base_rope = base_rope
+        self.variant_ropes = variant_ropes
+        self.spa_active = False
 
     def disarm(self):
-        self.rope_variants = None
+        self.base_rope = None
+        self.variant_ropes = None
+        self.spa_active = False
+
+    def current_ropes(self):
+        return self.variant_ropes if self.spa_active else [self.base_rope]
 
 
 _SPA_STATE = _SPAState()
@@ -204,13 +235,14 @@ class HRDiTFluxAttnProcessor(FluxAttnProcessor):
             scale = head_dim ** -0.5
 
         value_t = value.transpose(1, 2).contiguous()  # [B, H, S, D]
+        ropes = _SPA_STATE.current_ropes()
         acc = None
-        for rope_variant in _SPA_STATE.rope_variants:
+        for rope_variant in ropes:
             query_v = apply_rotary_emb(query, rope_variant, sequence_dim=1).transpose(1, 2).contiguous()
             key_v = apply_rotary_emb(key, rope_variant, sequence_dim=1).transpose(1, 2).contiguous()
             out = F.scaled_dot_product_attention(query_v, key_v, value_t, dropout_p=0.0, is_causal=False, scale=scale)
             acc = out if acc is None else acc + out
-        hidden_states = (acc / len(_SPA_STATE.rope_variants)).transpose(1, 2)  # [B, S, H, D]
+        hidden_states = (acc / len(ropes)).transpose(1, 2)  # [B, S, H, D]
         hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
 
         if encoder_hidden_states is not None:
@@ -237,20 +269,22 @@ class HRDiTFluxPipeline(FluxPipeline):
     Adapted from HRDiT, "Training-Free High-Resolution Image Generation with Off-the-Shelf Diffusion Transformer
     Models" (https://arxiv.org/abs/2608.07003); reference implementation at https://github.com/zylwithxy/HRDiT.
 
-    Two training-free pieces on top of the stock `FluxPipeline` denoise loop:
+    Three training-free pieces on top of the stock `FluxPipeline` denoise loop:
 
-    - **SPA (Spatial Position Alignment)** -- `build_bundle_id_variants` maps high-resolution rotary position ids
-      into the trained ~64x64 window via a monotonic bundle coarsening (no wrapping, so no periodic tiling), across
-      several sliding bundle-boundary variants. `HRDiTFluxAttnProcessor` runs attention once per variant and averages
-      the outputs, with a proportional attention scale for the longer sequence. This is the core training-free fix
-      for high-resolution "spatial disorder".
+    - **NTK-aware RoPE scaling** -- on every upscale-stage step the rotary base `theta` is multiplied by a per-stage
+      `ntk_factor`, compressing out-of-range high-resolution positions back into the trained band. This is the
+      primary high-resolution mechanism (`flux_rope`).
+    - **SPA (Spatial Position Alignment)** -- for the leading `spa_steps` steps of a stage only, `build_bundle_id_variants`
+      additionally coarsens position ids into the trained window via a monotonic bundle map (no wrapping, so no
+      periodic tiling) across sliding boundary variants; `HRDiTFluxAttnProcessor` runs attention once per variant and
+      averages the outputs, with a proportional attention scale. A light early-step correction for "spatial disorder".
     - **Progressive generation** -- denoising climbs a resolution ladder (1024 -> 2048 -> 4096 by default); each
-      stage bilinearly upsamples the previous stage's latent and re-noises it through the tail of the schedule. SPA
-      is active only on the upscale stages (the base stage is in-distribution and uses stock RoPE).
+      stage bilinearly upsamples the previous stage's latent and re-noises it through the tail of the schedule. The
+      base stage is in-distribution and uses stock RoPE.
 
     Not ported from the reference (documented follow-ups): the checkpoint-specific HAP head-scope pruning
-    (`configs/scope_plan_flux.json`), NTK-aware RoPE scaling, and per-step SPA scheduling. SPA here runs on every
-    step of every upscale stage and on every attention block.
+    (`configs/scope_plan_flux.json`) and the frequency-domain structure guidance (Butterworth low-pass + alpha/beta
+    blending in the flow-match step, swin patchify) that further stabilizes the highest stage.
 
     Args:
         prompt (`str` or `List[str]`): The prompt to render.
@@ -258,9 +292,13 @@ class HRDiTFluxPipeline(FluxPipeline):
         resolutions (`List[int]`, optional): Progressive resolution ladder (square side lengths). Defaults to
             doubling from 1024 up to the target resolution.
         group_num (`int`, defaults to 80): SPA bundle granularity; bundle size is `ceil(max_index / (group_num - 1))`.
-            Larger keeps more distinct positions inside the trained window. `group_num - 1` also bounds the number of
-            averaged variants.
+            Larger keeps more distinct positions inside the trained window.
+        ntk_factor (`List[float]`, optional): Per-upscale-stage NTK RoPE-base multiplier. Defaults to `[4.0, 10.0]`
+            (2048, 4096), extended by its last value for further stages.
+        spa_steps (`List[int]`, optional): Per-upscale-stage count of leading steps that use SPA. Defaults to
+            `[3, 0]` -- a light nudge at 2048, none at 4096 (NTK alone).
         stage_strength (`float`, defaults to 0.6): Fraction of the schedule each upsampled stage re-noises through.
+        guidance_scale_highres (`List[float]`, optional): Per-upscale-stage guidance. Defaults to `[4.5, 6.0]`.
 
     Example: see `EXAMPLE_DOC_STRING`.
     """
@@ -299,9 +337,12 @@ class HRDiTFluxPipeline(FluxPipeline):
         width: Optional[int] = None,
         resolutions: Optional[List[int]] = None,
         group_num: int = 80,
+        ntk_factor: Optional[List[float]] = None,
+        spa_steps: Optional[List[int]] = None,
         stage_strength: float = 0.6,
         num_inference_steps: int = 28,
         guidance_scale: float = 3.5,
+        guidance_scale_highres: Optional[List[float]] = None,
         num_images_per_prompt: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
@@ -311,11 +352,11 @@ class HRDiTFluxPipeline(FluxPipeline):
         return_dict: bool = True,
         max_sequence_length: int = 512,
     ):
-        r"""Generate a high-resolution image, training-free, with HRDiT (SPA + progressive generation).
+        r"""Generate a high-resolution image, training-free, with HRDiT (NTK RoPE + SPA + progressive generation).
 
-        Accepts the standard [`FluxPipeline`] arguments plus `resolutions` / `group_num` (SPA) and `stage_strength`
-        (progressive re-noising). `height` and `width` set the final resolution; the pipeline renders progressively
-        up to it.
+        Accepts the standard [`FluxPipeline`] arguments plus `resolutions` / `group_num` / `ntk_factor` / `spa_steps`
+        and `stage_strength` / `guidance_scale_highres`. `height` and `width` set the final resolution; the pipeline
+        renders progressively up to it.
 
         Examples:
         """
@@ -329,6 +370,17 @@ class HRDiTFluxPipeline(FluxPipeline):
 
         ladder = self._resolution_ladder(height, width, resolutions)
         target = max(height, width)
+
+        # Per-upscale-stage schedules (index j = ladder stage - 1). NTK-aware RoPE scaling is applied on every step
+        # and is the primary high-resolution mechanism; SPA augments only the leading `spa_steps` steps of a stage.
+        ntk_schedule = ntk_factor if ntk_factor is not None else [4.0, 10.0]
+        spa_schedule = spa_steps if spa_steps is not None else [3, 0]
+        guidance_hr = guidance_scale_highres if guidance_scale_highres is not None else [4.5, 6.0]
+
+        def _stage_value(schedule, j, fill):
+            if not schedule:
+                return fill
+            return schedule[j] if j < len(schedule) else schedule[-1]
 
         device = self._execution_device
         dtype = prompt_embeds.dtype if prompt_embeds is not None else self.transformer.dtype
@@ -350,16 +402,20 @@ class HRDiTFluxPipeline(FluxPipeline):
         )
         batch_size = prompt_embeds.shape[0]
 
-        if self.transformer.config.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32).expand(batch_size)
-        else:
-            guidance = None
+        guidance_embeds = self.transformer.config.guidance_embeds
+
+        def _guidance(scale):
+            if not guidance_embeds:
+                return None
+            return torch.full([1], scale, device=device, dtype=torch.float32).expand(batch_size)
 
         self._joint_attention_kwargs = {}
 
-        # 2. Install the SPA processor (armed per-stage below; disarmed => stock attention).
+        # 2. Install the SPA/NTK processor (armed per-stage below; disarmed => stock attention).
         original_attn_processors = dict(self.transformer.attn_processors)
         self.transformer.set_attn_processor(HRDiTFluxAttnProcessor())
+        axes_dim = self.transformer.pos_embed.axes_dim
+        rope_theta = self.transformer.pos_embed.theta
 
         try:
             # 3. Progressive denoising over the resolution ladder.
@@ -401,17 +457,30 @@ class HRDiTFluxPipeline(FluxPipeline):
 
                 image_ids = self._prepare_latent_image_ids(batch_size, grid_height, grid_width, device, dtype)
 
-                # SPA on the upscale stages only: coarsen the out-of-range ids into the trained window and
-                # precompute the per-variant rotary embeddings over the full [text; image] sequence.
-                if grid_height > 64 or grid_width > 64:
-                    variants = build_bundle_id_variants(image_ids, group_num)
-                    rope_variants = [
-                        self.transformer.pos_embed(torch.cat([text_ids, variant_ids], dim=0))
-                        for variant_ids in variants
-                    ]
-                    _SPA_STATE.arm(rope_variants)
-                else:
+                # Upscale stages: NTK-scaled RoPE on every step (the primary high-res mechanism), with SPA bundle
+                # variants precomputed for the leading `stage_spa_steps` steps only. The base stage is in-distribution
+                # and uses stock RoPE (state disarmed).
+                if stage == 0:
                     _SPA_STATE.disarm()
+                    stage_spa_steps = 0
+                    stage_guidance = _guidance(guidance_scale)
+                else:
+                    j = stage - 1
+                    stage_ntk = float(_stage_value(ntk_schedule, j, 1.0))
+                    stage_spa_steps = int(_stage_value(spa_schedule, j, 0))
+                    stage_guidance = _guidance(float(_stage_value(guidance_hr, j, guidance_scale)))
+                    base_rope = flux_rope(
+                        torch.cat([text_ids, image_ids], dim=0), axes_dim, rope_theta, ntk_factor=stage_ntk
+                    )
+                    if stage_spa_steps > 0:
+                        variants = build_bundle_id_variants(image_ids, group_num)
+                        variant_ropes = [
+                            flux_rope(torch.cat([text_ids, v], dim=0), axes_dim, rope_theta, ntk_factor=stage_ntk)
+                            for v in variants
+                        ]
+                    else:
+                        variant_ropes = [base_rope]
+                    _SPA_STATE.arm(base_rope, variant_ropes)
 
                 mu = calculate_shift(
                     grid_height * grid_width,
@@ -434,14 +503,15 @@ class HRDiTFluxPipeline(FluxPipeline):
 
                 self.set_progress_bar_config(desc=f"HRDiT {stage_width}x{stage_height}")
                 with self.progress_bar(total=len(timesteps)) as progress_bar:
-                    for t in timesteps:
+                    for i, t in enumerate(timesteps):
                         self._current_timestep = t
+                        _SPA_STATE.spa_active = i < stage_spa_steps
                         timestep = t.expand(latents.shape[0]).to(latents.dtype)
                         with self.transformer.cache_context("cond"):
                             noise_pred = self.transformer(
                                 hidden_states=latents,
                                 timestep=timestep / 1000,
-                                guidance=guidance,
+                                guidance=stage_guidance,
                                 pooled_projections=pooled_prompt_embeds,
                                 encoder_hidden_states=prompt_embeds,
                                 txt_ids=text_ids,
