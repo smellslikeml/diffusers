@@ -415,8 +415,7 @@ class HRDiTFluxPipeline(FluxPipeline):
         else:
             guidance = None
 
-        if self._joint_attention_kwargs is None:
-            self._joint_attention_kwargs = {}
+        self._joint_attention_kwargs = {}
 
         # 2. Optionally arm HAP.
         original_attn_processors = None
