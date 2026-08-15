@@ -15,6 +15,7 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torchvision.transforms.functional import gaussian_blur
 
 from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.models.transformers.transformer_flux import FluxAttnProcessor, _get_qkv_projections
@@ -22,14 +23,6 @@ from diffusers.pipelines.flux.pipeline_flux import FluxPipeline, calculate_shift
 from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
 from diffusers.utils import logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
-
-
-try:
-    from torchvision.transforms.functional import gaussian_blur as _tv_gaussian_blur
-
-    _TORCHVISION_AVAILABLE = True
-except ImportError:
-    _TORCHVISION_AVAILABLE = False
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -139,10 +132,8 @@ def split_low_freq(x: torch.Tensor, freq_filter: torch.Tensor) -> torch.Tensor:
 
 
 def sharpen(image: torch.Tensor, kernel_size: int = 3, sigma: float = 1.0, alpha: float = 1.0) -> torch.Tensor:
-    """Unsharp-mask sharpening of an image tensor; no-op if torchvision is unavailable."""
-    if not _TORCHVISION_AVAILABLE:
-        return image
-    blurred = _tv_gaussian_blur(image, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
+    """Unsharp-mask sharpening of the upscaled structural prior before it is re-encoded."""
+    blurred = gaussian_blur(image, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
     return (alpha + 1.0) * image - alpha * blurred
 
 
@@ -159,7 +150,6 @@ class _SPAState:
         self.base_rope = None
         self.variant_ropes = None
         self.spa_active = False
-        self.proportional = True
 
     @property
     def enabled(self):
@@ -226,10 +216,8 @@ class HRDiTFluxAttnProcessor(FluxAttnProcessor):
 
         head_dim = query.shape[-1]
         seq_len = query.shape[1]
-        if _SPA_STATE.proportional and seq_len > 1:
-            scale = math.sqrt(math.log(seq_len, _TRAIN_SEQ_LEN) / head_dim)
-        else:
-            scale = head_dim**-0.5
+        # Proportional attention scale for the longer high-res sequence (equals the stock 1/sqrt(d) at train length).
+        scale = math.sqrt(math.log(seq_len, _TRAIN_SEQ_LEN) / head_dim) if seq_len > 1 else head_dim**-0.5
 
         value_t = value.transpose(1, 2).contiguous()  # [B, H, S, D]
         ropes = _SPA_STATE.current_ropes()
@@ -353,22 +341,17 @@ class HRDiTFluxPipeline(FluxPipeline):
         beta=0.0,
     ):
         """
-        One flow-match Euler step, optionally with HRDiT structure guidance.
+        One flow-match step (the Euler update is delegated to ``self.scheduler.step``), optionally with HRDiT
+        structure guidance.
 
         Structure guidance (``structure_on``) pulls the low-frequency band of the current predicted clean latent
         toward the upsampled previous-stage ``pred_x0`` (weight ``alpha``), then applies a cross-step velocity
-        momentum (weight ``beta``). Returns ``(prev_sample, pred_x0)`` where ``pred_x0`` is the *pre-guidance*
-        prediction (stored for the next stage's reference, matching the reference implementation).
+        momentum (weight ``beta``); ``self._mo_high`` / ``self._mo_ref`` are reset per stage by the caller. Returns
+        ``(prev_sample, pred_x0)`` where ``pred_x0`` is the *pre-guidance* prediction (stored as the next stage's
+        structural reference).
         """
-        scheduler = self.scheduler
-        if scheduler.step_index is None:
-            scheduler._init_step_index(timestep)
-            self._mo_high = None
-            self._mo_ref = None
-
         sample = sample.to(torch.float32)
-        sigma = scheduler.sigmas[scheduler.step_index]
-        sigma_next = scheduler.sigmas[scheduler.step_index + 1]
+        sigma = self.scheduler.sigmas[self.scheduler.index_for_timestep(timestep)]
 
         pred_x0 = sample - model_output.to(torch.float32) * sigma
         original_pred_x0 = pred_x0
@@ -398,9 +381,9 @@ class HRDiTFluxPipeline(FluxPipeline):
         else:
             model_output = model_output.to(torch.float32)
 
-        prev_sample = (sample + (sigma_next - sigma) * model_output).to(self.transformer.dtype)
-        scheduler._step_index += 1
-        return prev_sample, original_pred_x0
+        # Let the scheduler own the Euler update; structure guidance only adjusts the velocity above.
+        prev_sample = self.scheduler.step(model_output, timestep, sample, return_dict=False)[0]
+        return prev_sample.to(self.transformer.dtype), original_pred_x0
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -511,12 +494,10 @@ class HRDiTFluxPipeline(FluxPipeline):
             base_guidance = _guidance(guidance_scale)
 
             timesteps, _ = retrieve_timesteps(self.scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
-            self.scheduler._step_index = None
             cur_h, cur_w = base_h, base_w
             self.set_progress_bar_config(desc=f"HRDiT {base_w}x{base_h}")
             with self.progress_bar(total=len(timesteps)) as progress_bar:
                 for t in timesteps:
-                    self._current_timestep = t
                     timestep = t.expand(latents.shape[0]).to(latents.dtype)
                     with self.transformer.cache_context("cond"):
                         noise_pred = self.transformer(
@@ -577,12 +558,13 @@ class HRDiTFluxPipeline(FluxPipeline):
                 dlfg_timesteps = self.scheduler.timesteps[-stage_steps:]
                 noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
                 latents = self.scheduler.scale_noise(latents, dlfg_timesteps[:1], noise).to(self.transformer.dtype)
-                self.scheduler._step_index = None
 
+                # Reset the structure-guidance velocity momentum at the start of each stage.
+                self._mo_high = None
+                self._mo_ref = None
                 self.set_progress_bar_config(desc=f"HRDiT {stage_w}x{stage_h}")
                 with self.progress_bar(total=len(dlfg_timesteps)) as progress_bar:
                     for i, t in enumerate(dlfg_timesteps):
-                        self._current_timestep = t
                         _SPA_STATE.spa_active = i < stage_spa_steps
                         decay = (stage_steps - i) / stage_steps
                         with self.transformer.cache_context("cond"):
@@ -619,8 +601,6 @@ class HRDiTFluxPipeline(FluxPipeline):
                         progress_bar.update()
 
                 cur_h, cur_w = stage_h, stage_w
-
-            self._current_timestep = None
 
             if output_type == "latent":
                 image = latents
