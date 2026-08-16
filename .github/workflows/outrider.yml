@@ -11,6 +11,7 @@ on:
         options:
           - anthropic
           - zai
+          - moonshot
       model:
         description: 'Specific model name (empty = provider default).'
         required: false
@@ -52,10 +53,13 @@ jobs:
         env:
           ANTHROPIC_API_KEY_SECRET: ${{ secrets.ANTHROPIC_API_KEY }}
           ZAI_API_KEY_SECRET: ${{ secrets.ZAI_API_KEY }}
+          MOONSHOT_API_KEY_SECRET: ${{ secrets.MOONSHOT_API_KEY }}
           MODEL_INPUT: ${{ inputs.model }}
         run: |
           if [ "${{ inputs.provider }}" = "zai" ]; then
             echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY_SECRET" >> "$GITHUB_ENV"
+          elif [ "${{ inputs.provider }}" = "moonshot" ]; then
+            echo "ANTHROPIC_AUTH_TOKEN=$MOONSHOT_API_KEY_SECRET" >> "$GITHUB_ENV"
           else
             echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_SECRET" >> "$GITHUB_ENV"
           fi
@@ -71,4 +75,4 @@ jobs:
           publish: ${{ inputs.publish }}
           claude-timeout: ${{ inputs.claude-timeout }}
           lead-content: ${{ inputs.lead-content }}
-          model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || '' }}
+          model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || inputs.provider == 'moonshot' && 'https://api.moonshot.ai/anthropic' || '' }}
