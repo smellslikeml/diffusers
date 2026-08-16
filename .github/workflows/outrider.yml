@@ -36,6 +36,10 @@ on:
         description: 'Optional hand-crafted implementation spec (landing-zone-to-PR mode). Overrides suggested_experiment.'
         required: false
         default: ''
+      mode:
+        description: 'recommend (default) or brief — brief = lead-content IS the spec (no ranker/paper anchor).'
+        required: false
+        default: 'recommend'
 
 jobs:
   recommend:
@@ -75,4 +79,5 @@ jobs:
           publish: ${{ inputs.publish }}
           claude-timeout: ${{ inputs.claude-timeout }}
           lead-content: ${{ inputs.lead-content }}
+          mode: ${{ inputs.mode }}
           model-base-url: ${{ inputs.provider == 'zai' && 'https://api.z.ai/api/anthropic' || inputs.provider == 'moonshot' && 'https://api.moonshot.ai/anthropic' || '' }}
