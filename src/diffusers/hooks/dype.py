@@ -14,7 +14,6 @@
 
 import math
 
-import numpy as np
 import torch
 
 from ..utils import get_logger
@@ -45,8 +44,8 @@ def find_correction_range(low_ratio, high_ratio, dim, base, ori_max_pe_len):
     """
     Find the correction range for NTK-by-parts interpolation.
     """
-    low = np.floor(find_correction_factor(low_ratio, dim, base, ori_max_pe_len))
-    high = np.ceil(find_correction_factor(high_ratio, dim, base, ori_max_pe_len))
+    low = math.floor(find_correction_factor(low_ratio, dim, base, ori_max_pe_len))
+    high = math.ceil(find_correction_factor(high_ratio, dim, base, ori_max_pe_len))
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
