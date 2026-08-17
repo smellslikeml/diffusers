@@ -814,6 +814,8 @@
       title: Custom activation functions
     - local: api/cache
       title: Caching methods
+    - local: api/dype
+      title: Resolution extrapolation
     - local: api/normalization
       title: Custom normalization layers
     - local: api/utilities
