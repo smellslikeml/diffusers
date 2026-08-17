@@ -20,6 +20,10 @@ from diffusers.hooks.dype import (
     DyPEHook,
     _DyPEPosEmbed,
     _dype_rotary_pos_embed,
+    compute_axis_spectral_profiles,
+    compute_base_mscale,
+    compute_dynamic_spread,
+    compute_sega_allocation,
     find_correction_factor,
     find_correction_range,
     find_newbase_ntk,
@@ -267,7 +271,7 @@ class TestDypeHook:
         assert len(model._forward_pre_hooks) == 0  # torn down on removal
 
     def test_apply_dype_validation(self):
-        with pytest.raises(ValueError, match='must be "yarn"'):
+        with pytest.raises(ValueError, match="must be one of"):
             apply_dype(DummyFluxLikeTransformer(), method="ntk")
 
         class NoPosEmbedModel(torch.nn.Module):
@@ -276,3 +280,110 @@ class TestDypeHook:
 
         with pytest.raises(ValueError, match="`pos_embed`"):
             apply_dype(NoPosEmbedModel())
+
+
+class DummyFluxLikeTransformerWithLatent(torch.nn.Module):
+    # Like DummyFluxLikeTransformer but exposes `hidden_states`/`img_ids` so the SEGA spectral path can be exercised.
+    def __init__(self):
+        super().__init__()
+        self.pos_embed = FluxPosEmbed(THETA, AXES_DIM)
+
+    def forward(self, hidden_states, encoder_hidden_states=None, pooled_projections=None, timestep=None, img_ids=None, txt_ids=None):
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        cos, sin = self.pos_embed(ids)
+        return cos, sin
+
+
+class TestSegaHelpers:
+    def test_compute_base_mscale(self):
+        # m_ref = (target / train) ** kappa, clamped so the ratio is >= 1.
+        assert compute_base_mscale(4096, 1024, coefficient=0.08) == pytest.approx(4.0**0.08)
+        assert compute_base_mscale(2048, 1024, coefficient=0.08) == pytest.approx(2.0**0.08)
+        # At or below the trained resolution the ratio clamps to 1 -> m_ref == 1.
+        assert compute_base_mscale(512, 1024, coefficient=0.08) == pytest.approx(1.0)
+
+    def test_compute_dynamic_spread_endpoints(self):
+        # A perfectly flat spectrum is maximally noise-like -> spread == spread_min.
+        flat = torch.ones(32)
+        assert compute_dynamic_spread(flat, spread_min=0.0, spread_max=1.0) == pytest.approx(0.0, abs=1e-5)
+        # A sharply concentrated spectrum is highly structured -> spread near spread_max.
+        peaked = torch.full((32,), 1e-6)
+        peaked[0] = 1.0
+        assert compute_dynamic_spread(peaked, spread_min=0.0, spread_max=1.0) > 0.9
+
+    def test_compute_sega_allocation_zero_sum_and_shape(self):
+        # Non-flat profile -> non-uniform per-dim mscale; with min_mscale=0 the redistribution is zero-mean so the
+        # average temperature stays at the reference magnitude.
+        energy = torch.linspace(1.0, 10.0, 64)
+        freqs = 1.0 / (THETA ** (torch.arange(0, 56, 2).float() / 56))
+        m = compute_sega_allocation(energy, freqs, base_mscale=1.12, spread=1.0, alpha=0.15, beta=1.5, min_mscale=0.0)
+        assert m.shape == (28,)
+        assert (m.max() - m.min()).item() > 1e-3  # non-uniform
+        assert m.mean().item() == pytest.approx(1.12, abs=1e-3)  # zero-sum redistribution
+
+    def test_compute_sega_allocation_degenerate_is_uniform(self):
+        energy = torch.linspace(1.0, 10.0, 64)
+        freqs = 1.0 / (THETA ** (torch.arange(0, 56, 2).float() / 56))
+        m = compute_sega_allocation(energy, freqs, base_mscale=1.12, spread=0.0, alpha=0.15)
+        assert torch.allclose(m, torch.full((28,), 1.12), atol=1e-6)
+
+    def test_axis_profiles_shape(self):
+        hs = torch.randn(1, 128 * 128, 8)
+        e_h, e_w = compute_axis_spectral_profiles(hs, 128, 128, n_bins_h=64, n_bins_w=64)
+        assert e_h.shape == (64,) and e_w.shape == (64,)
+
+
+class TestSegaPosEmbed:
+    def test_noop_at_trained_resolution(self):
+        # SEGA must be a no-op at/below 1024x1024, identical to plain rope ("base").
+        sega = _DyPEPosEmbed(THETA, AXES_DIM, method="sega")
+        base = _DyPEPosEmbed(THETA, AXES_DIM, method="base")
+        for patch_grid in (32, BASE_PATCHES):
+            ids = build_flux_style_ids(num_txt_tokens=8, patch_grid=patch_grid)
+            cs, _ = sega(ids)
+            cb, _ = base(ids)
+            assert torch.equal(cs, cb)
+
+    def test_engages_above_trained_resolution(self):
+        sega = _DyPEPosEmbed(THETA, AXES_DIM, method="sega")
+        yarn = _DyPEPosEmbed(THETA, AXES_DIM, method="yarn")
+        ids = build_flux_style_ids(num_txt_tokens=8, patch_grid=128)
+
+        # Without spectral data, SEGA falls back to a uniform reference magnitude but still differs from YaRN.
+        cs, _ = sega(ids)
+        cy, _ = yarn(ids)
+        assert cs.shape == cy.shape
+        assert not torch.equal(cs, cy)
+        # Text axis (plain rope) is untouched.
+        assert torch.equal(cs[:, : AXES_DIM[0]], cy[:, : AXES_DIM[0]])
+
+    def test_per_dim_mscale_is_non_uniform_with_spectral_data(self):
+        sega = _DyPEPosEmbed(THETA, AXES_DIM, method="sega")
+        energy = torch.linspace(1.0, 10.0, 64)
+        sega.set_spectral_data(energy, energy, dynamic_spread=1.0, target_res_h=2048, target_res_w=2048)
+        m = sega._compute_sega_mscale(1, AXES_DIM[1], scale=128 / BASE_PATCHES, device=torch.device("cpu"))
+        assert m.shape == (AXES_DIM[1] // 2,)
+        assert (m.max() - m.min()).item() > 1e-3
+
+
+class TestSegaHook:
+    def test_sega_reads_latent_and_sets_spectral_data(self):
+        model = DummyFluxLikeTransformerWithLatent()
+        apply_dype(model, method="sega")
+        assert len(model._forward_pre_hooks) == 1
+
+        G = 96  # > 64 base patches so SEGA engages
+        ids = build_flux_style_ids(num_txt_tokens=8, patch_grid=G)
+        img_ids, txt_ids = ids[8:], ids[:8]
+        hidden_states = torch.randn(1, G * G, 8)
+
+        model(hidden_states=hidden_states, timestep=torch.tensor([0.5]), img_ids=img_ids, txt_ids=txt_ids)
+        pe = model.pos_embed
+        assert pe.current_timestep == pytest.approx(0.5)
+        assert pe._energy_profile_h is not None and pe._energy_profile_w is not None
+        assert pe._target_res_h == G * pe.patch_size
+
+        registry = HookRegistry.check_if_exists_or_initialize(model)
+        registry.remove_hook("dype_hook")
+        assert model.pos_embed.__class__ is FluxPosEmbed
+        assert len(model._forward_pre_hooks) == 0
