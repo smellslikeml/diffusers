@@ -22,8 +22,8 @@ from diffusers import FluxPipeline, apply_dype
 pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-Krea-dev", torch_dtype=torch.bfloat16)
 pipe.enable_model_cpu_offload()
 
-# method="yarn" (default) is plain DyPE; method="sega" adds SEGA spectral attention.
-apply_dype(pipe.transformer, method="sega")
+# method="yarn" (default) is plain DyPE; method="spectral" adds SEGA spectral attention.
+apply_dype(pipe.transformer, method="spectral")
 
 # Above the trained resolution, also flatten the flow-matching shift schedule so the sampler
 # does not stall near pure noise (the default shift `mu` grows with the image sequence length).

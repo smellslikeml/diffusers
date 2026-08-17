@@ -30,7 +30,7 @@ _DYPE_HOOK = "dype_hook"
 # DyPE schedule adapted from https://github.com/guyyariv/DyPE (MIT). DyPE: "Dynamic Position Extrapolation for Ultra
 # High Resolution Diffusion" (https://arxiv.org/abs/2510.20766).
 #
-# SEGA spectral mscale (method="sega") adapted from https://github.com/wildminder/ComfyUI-DyPE (Apache-2.0). SEGA:
+# SEGA spectral mscale (method="spectral") adapted from https://github.com/wildminder/ComfyUI-DyPE (Apache-2.0). SEGA:
 # "Spectral-Energy Guided Attention for Resolution Extrapolation in Diffusion Transformers"
 # (https://arxiv.org/abs/2605.22668).
 
@@ -66,7 +66,7 @@ def find_newbase_ntk(dim, base, scale):
 
 
 # ---------------------------------------------------------------------------
-# SEGA: spectral-energy helpers (method="sega")
+# SEGA: spectral-energy helpers (method="spectral")
 # ---------------------------------------------------------------------------
 
 
@@ -172,7 +172,7 @@ def compute_dynamic_spread(
 
 
 @torch.no_grad()
-def compute_sega_allocation(
+def compute_spectral_allocation(
     energy_profile: torch.Tensor,
     freqs: torch.Tensor,
     base_mscale: float,
@@ -237,11 +237,11 @@ def _dype_rotary_pos_embed(
     ori_max_pe_len=64,
     dype=False,
     current_timestep=1.0,
-    sega_mscale=None,
+    spectral_mscale=None,
 ):
     r"""
     Precompute the frequency tensor for complex exponentials (cis) with RoPE. Supports YaRN interpolation (optionally
-    modulated by the DyPE timestep schedule) and, via `sega_mscale`, SEGA's per-dimension spectral attention
+    modulated by the DyPE timestep schedule) and, via `spectral_mscale`, SEGA's per-dimension spectral attention
     temperature.
 
     Args:
@@ -273,7 +273,7 @@ def _dype_rotary_pos_embed(
             ranges (`kappa = current_timestep**2`).
         current_timestep (`float`, *optional*, defaults to `1.0`):
             Current timestep for DyPE, normalized to [0, 1] where 1 is pure noise.
-        sega_mscale (`torch.Tensor`, *optional*):
+        spectral_mscale (`torch.Tensor`, *optional*):
             Per-dimension SEGA attention temperature of shape `[dim // 2]`. When provided, it replaces the scalar YaRN
             attention temperature and is applied to the returned `cos`/`sin`.
 
@@ -346,9 +346,9 @@ def _dype_rotary_pos_embed(
         freqs_cos = freqs.cos().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()  # [S, D]
         freqs_sin = freqs.sin().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()  # [S, D]
 
-        if sega_mscale is not None:
+        if spectral_mscale is not None:
             # SEGA per-RoPE-dimension attention temperature. Replaces the scalar YaRN temperature below.
-            ms = sega_mscale.to(device=freqs_cos.device, dtype=freqs_cos.dtype).repeat_interleave(2)  # [D]
+            ms = spectral_mscale.to(device=freqs_cos.device, dtype=freqs_cos.dtype).repeat_interleave(2)  # [D]
             freqs_cos = freqs_cos * ms
             freqs_sin = freqs_sin * ms
         elif yarn and max_pe_len is not None and max_pe_len > ori_max_pe_len:
@@ -377,7 +377,7 @@ class _DyPEPosEmbed(torch.nn.Module):
     resolution (`base_resolution // patch_size = 1024 // 16 = 64`). As a result, generation at or below the trained
     resolution is a no-op compared to the stock positional embedding.
 
-    With `method="sega"` the spatial axes use NTK-scaled frequencies together with SEGA's per-dimension spectral
+    With `method="spectral"` the spatial axes use NTK-scaled frequencies together with SEGA's per-dimension spectral
     attention temperature, computed from the latent's Fourier spectrum (set per step via `set_spectral_data`).
     """
 
@@ -387,10 +387,10 @@ class _DyPEPosEmbed(torch.nn.Module):
         axes_dim: list[int],
         method: str = "yarn",
         dype: bool = True,
-        sega_alpha: float = 0.15,
-        sega_beta: float = 1.5,
-        sega_kappa: float = 0.08,
-        sega_min_mscale: float = 1.0,
+        spectral_alpha: float = 0.15,
+        spectral_beta: float = 1.5,
+        spectral_kappa: float = 0.08,
+        spectral_min_mscale: float = 1.0,
     ):
         super().__init__()
         self.theta = theta
@@ -402,13 +402,13 @@ class _DyPEPosEmbed(torch.nn.Module):
         self.method = method
         self.dype = dype if method != "base" else False
         # SEGA parameters
-        self.sega_alpha = sega_alpha
-        self.sega_beta = sega_beta
-        self.sega_kappa = sega_kappa
-        self.sega_min_mscale = sega_min_mscale
+        self.spectral_alpha = spectral_alpha
+        self.spectral_beta = spectral_beta
+        self.spectral_kappa = spectral_kappa
+        self.spectral_min_mscale = spectral_min_mscale
         # DyPE runtime state
         self.current_timestep = 1.0
-        # SEGA runtime state (set per step by the hook when method == "sega")
+        # SEGA runtime state (set per step by the hook when method == "spectral")
         self._energy_profile_h = None
         self._energy_profile_w = None
         self._dynamic_spread = 0.0
@@ -420,14 +420,14 @@ class _DyPEPosEmbed(torch.nn.Module):
         self.current_timestep = timestep
 
     def set_spectral_data(self, energy_profile_h, energy_profile_w, dynamic_spread, target_res_h=0, target_res_w=0):
-        """Set the per-step SEGA spectral data (called by the hook before each forward when `method == 'sega'`)."""
+        """Set the per-step SEGA spectral data (called by the hook before each forward when `method == 'spectral'`)."""
         self._energy_profile_h = energy_profile_h
         self._energy_profile_w = energy_profile_w
         self._dynamic_spread = dynamic_spread
         self._target_res_h = target_res_h
         self._target_res_w = target_res_w
 
-    def _compute_sega_mscale(self, axis_idx, axis_dim, scale, device):
+    def _compute_spectral_mscale(self, axis_idx, axis_dim, scale, device):
         # Per-dimension SEGA attention temperature for a spatial axis, or None to fall back to plain RoPE.
         energy_profile = self._energy_profile_h if axis_idx == 1 else self._energy_profile_w
         target_res = self._target_res_h if axis_idx == 1 else self._target_res_w
@@ -435,7 +435,7 @@ class _DyPEPosEmbed(torch.nn.Module):
         m_ref = compute_base_mscale(
             target_res if target_res > 0 else 2 * self.training_res_pixels,
             self.training_res_pixels,
-            coefficient=self.sega_kappa,
+            coefficient=self.spectral_kappa,
         )
         if m_ref <= 1.0 + 1e-8:
             return None
@@ -446,14 +446,14 @@ class _DyPEPosEmbed(torch.nn.Module):
         exponents = torch.arange(0, axis_dim, 2, dtype=torch.float32, device=device) / axis_dim
         theta_ntk = self.theta * (scale ** (axis_dim / (axis_dim - 2)))
         freqs = 1.0 / (theta_ntk**exponents)
-        return compute_sega_allocation(
+        return compute_spectral_allocation(
             energy_profile=energy_profile,
             freqs=freqs,
             base_mscale=m_ref,
             spread=self._dynamic_spread,
-            alpha=self.sega_alpha,
-            beta=self.sega_beta,
-            min_mscale=self.sega_min_mscale,
+            alpha=self.spectral_alpha,
+            beta=self.spectral_beta,
+            min_mscale=self.spectral_min_mscale,
         )
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
@@ -486,15 +486,15 @@ class _DyPEPosEmbed(torch.nn.Module):
                         dype=self.dype,
                         current_timestep=self.current_timestep,
                     )
-                elif current_patches > self.base_patches and self.method == "sega":
+                elif current_patches > self.base_patches and self.method == "spectral":
                     scale = current_patches / self.base_patches
                     ntk_factor = scale ** (self.axes_dim[i] / (self.axes_dim[i] - 2))
-                    sega_mscale = self._compute_sega_mscale(i, self.axes_dim[i], scale, pos.device)
+                    spectral_mscale = self._compute_spectral_mscale(i, self.axes_dim[i], scale, pos.device)
                     cos, sin = _dype_rotary_pos_embed(
                         **common_kwargs,
                         yarn=False,
                         ntk_factor=ntk_factor,
-                        sega_mscale=sega_mscale,
+                        spectral_mscale=spectral_mscale,
                     )
                 else:
                     cos, sin = _dype_rotary_pos_embed(**common_kwargs)
@@ -513,7 +513,7 @@ class DyPEHook(ModelHook):
     r"""
     A hook that swaps the positional embedding of a Flux-like transformer for a `_DyPEPosEmbed` and feeds it the
     current (normalized) diffusion timestep at every forward pass, enabling training-free ultra-high-resolution
-    generation. With `method="sega"` it additionally computes the latent's spectral energy each step and feeds it to
+    generation. With `method="spectral"` it additionally computes the latent's spectral energy each step and feeds it to
     the embedding for SEGA's per-dimension attention temperature.
 
     The runtime state (timestep, and the SEGA spectral profiles) is delivered through a native `torch.nn.Module`
@@ -526,19 +526,19 @@ class DyPEHook(ModelHook):
         self,
         method: str = "yarn",
         dype: bool = True,
-        sega_alpha: float = 0.15,
-        sega_beta: float = 1.5,
-        sega_kappa: float = 0.08,
-        sega_min_mscale: float = 1.0,
+        spectral_alpha: float = 0.15,
+        spectral_beta: float = 1.5,
+        spectral_kappa: float = 0.08,
+        spectral_min_mscale: float = 1.0,
     ) -> None:
         super().__init__()
 
         self.method = method
         self.dype = dype
-        self.sega_alpha = sega_alpha
-        self.sega_beta = sega_beta
-        self.sega_kappa = sega_kappa
-        self.sega_min_mscale = sega_min_mscale
+        self.spectral_alpha = spectral_alpha
+        self.spectral_beta = spectral_beta
+        self.spectral_kappa = spectral_kappa
+        self.spectral_min_mscale = spectral_min_mscale
         self._original_pos_embed = None
         self._timestep_hook_handle = None
 
@@ -556,13 +556,13 @@ class DyPEHook(ModelHook):
             axes_dim=pos_embed.axes_dim,
             method=self.method,
             dype=self.dype,
-            sega_alpha=self.sega_alpha,
-            sega_beta=self.sega_beta,
-            sega_kappa=self.sega_kappa,
-            sega_min_mscale=self.sega_min_mscale,
+            spectral_alpha=self.spectral_alpha,
+            spectral_beta=self.spectral_beta,
+            spectral_kappa=self.spectral_kappa,
+            spectral_min_mscale=self.spectral_min_mscale,
         )
 
-        use_sega = self.method == "sega"
+        use_spectral = self.method == "spectral"
 
         def _feed_runtime_state(mod, args, kwargs):
             timestep = kwargs.get("timestep", None)
@@ -579,7 +579,7 @@ class DyPEHook(ModelHook):
                     timestep = timestep.flatten()[0]
                 mod.pos_embed.set_timestep(float(timestep))
 
-            if use_sega and hidden_states is not None and img_ids is not None:
+            if use_spectral and hidden_states is not None and img_ids is not None:
                 _feed_spectral_data(mod.pos_embed, hidden_states, img_ids)
 
         self._timestep_hook_handle = module.register_forward_pre_hook(_feed_runtime_state, with_kwargs=True)
@@ -624,10 +624,10 @@ def apply_dype(
     module: torch.nn.Module,
     method: str = "yarn",
     dype: bool = True,
-    sega_alpha: float = 0.15,
-    sega_beta: float = 1.5,
-    sega_kappa: float = 0.08,
-    sega_min_mscale: float = 1.0,
+    spectral_alpha: float = 0.15,
+    spectral_beta: float = 1.5,
+    spectral_kappa: float = 0.08,
+    spectral_min_mscale: float = 1.0,
 ) -> None:
     r"""
     Applies [DyPE](https://huggingface.co/papers/2510.20766) to a given transformer to enable training-free
@@ -640,21 +640,21 @@ def apply_dype(
             `theta` and `axes_dim`, such as the stock `FluxTransformer2DModel`. At or below the trained resolution
             (1024x1024 for Flux), the hook is a no-op.
         method (`str`, defaults to `"yarn"`):
-            The position extrapolation method. `"yarn"` is DyPE's YaRN / NTK-by-parts schedule. `"sega"` uses
+            The position extrapolation method. `"yarn"` is DyPE's YaRN / NTK-by-parts schedule. `"spectral"` uses
             NTK-scaled frequencies together with SEGA's per-dimension spectral attention temperature, which reduces
             the high-frequency speckle that a scalar temperature (`"yarn"`) can leave at very high resolutions.
         dype (`bool`, defaults to `True`):
             Whether to modulate the YaRN extrapolation schedule by the diffusion timestep (`kappa = t^2`). Only
             affects `method="yarn"`.
-        sega_alpha (`float`, defaults to `0.15`):
-            SEGA correction amplitude (only used when `method="sega"`).
-        sega_beta (`float`, defaults to `1.5`):
-            SEGA tanh sharpness (only used when `method="sega"`).
-        sega_kappa (`float`, defaults to `0.08`):
+        spectral_alpha (`float`, defaults to `0.15`):
+            SEGA correction amplitude (only used when `method="spectral"`).
+        spectral_beta (`float`, defaults to `1.5`):
+            SEGA tanh sharpness (only used when `method="spectral"`).
+        spectral_kappa (`float`, defaults to `0.08`):
             Exponent of the SEGA reference magnitude `m_ref = (R_target / R_train) ** kappa` (only used when
-            `method="sega"`).
-        sega_min_mscale (`float`, defaults to `1.0`):
-            Floor for the per-dimension SEGA temperature (only used when `method="sega"`).
+            `method="spectral"`).
+        spectral_min_mscale (`float`, defaults to `1.0`):
+            Floor for the per-dimension SEGA temperature (only used when `method="spectral"`).
 
     Example:
     ```python
@@ -664,7 +664,7 @@ def apply_dype(
     >>> pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-Krea-dev", torch_dtype=torch.bfloat16)
     >>> pipe.enable_model_cpu_offload()
 
-    >>> apply_dype(pipe.transformer, method="sega")  # or method="yarn" for plain DyPE
+    >>> apply_dype(pipe.transformer, method="spectral")  # or method="yarn" for plain DyPE
 
     >>> # Above the trained resolution, also flatten the flow-matching shift schedule (see notes).
     >>> pipe.scheduler.register_to_config(base_shift=1.15, max_shift=1.15)
@@ -673,18 +673,18 @@ def apply_dype(
     ```
     """
 
-    if method not in ("yarn", "sega", "base"):
-        raise ValueError(f'`method` must be one of "yarn", "sega", "base", but got {method!r}.')
+    if method not in ("yarn", "spectral", "base"):
+        raise ValueError(f'`method` must be one of "yarn", "spectral", "base", but got {method!r}.')
 
     logger.debug(f"Enabling DyPE (method={method}, dype={dype}) on {module.__class__.__name__}")
 
     hook = DyPEHook(
         method=method,
         dype=dype,
-        sega_alpha=sega_alpha,
-        sega_beta=sega_beta,
-        sega_kappa=sega_kappa,
-        sega_min_mscale=sega_min_mscale,
+        spectral_alpha=spectral_alpha,
+        spectral_beta=spectral_beta,
+        spectral_kappa=spectral_kappa,
+        spectral_min_mscale=spectral_min_mscale,
     )
     registry = HookRegistry.check_if_exists_or_initialize(module)
     registry.register_hook(hook, _DYPE_HOOK)

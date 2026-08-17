@@ -23,7 +23,7 @@ from diffusers.hooks.dype import (
     compute_axis_spectral_profiles,
     compute_base_mscale,
     compute_dynamic_spread,
-    compute_sega_allocation,
+    compute_spectral_allocation,
     find_correction_factor,
     find_correction_range,
     find_newbase_ntk,
@@ -294,7 +294,7 @@ class DummyFluxLikeTransformerWithLatent(torch.nn.Module):
         return cos, sin
 
 
-class TestSegaHelpers:
+class TestSpectralHelpers:
     def test_compute_base_mscale(self):
         # m_ref = (target / train) ** kappa, clamped so the ratio is >= 1.
         assert compute_base_mscale(4096, 1024, coefficient=0.08) == pytest.approx(4.0**0.08)
@@ -311,20 +311,20 @@ class TestSegaHelpers:
         peaked[0] = 1.0
         assert compute_dynamic_spread(peaked, spread_min=0.0, spread_max=1.0) > 0.9
 
-    def test_compute_sega_allocation_zero_sum_and_shape(self):
+    def test_compute_spectral_allocation_zero_sum_and_shape(self):
         # Non-flat profile -> non-uniform per-dim mscale; with min_mscale=0 the redistribution is zero-mean so the
         # average temperature stays at the reference magnitude.
         energy = torch.linspace(1.0, 10.0, 64)
         freqs = 1.0 / (THETA ** (torch.arange(0, 56, 2).float() / 56))
-        m = compute_sega_allocation(energy, freqs, base_mscale=1.12, spread=1.0, alpha=0.15, beta=1.5, min_mscale=0.0)
+        m = compute_spectral_allocation(energy, freqs, base_mscale=1.12, spread=1.0, alpha=0.15, beta=1.5, min_mscale=0.0)
         assert m.shape == (28,)
         assert (m.max() - m.min()).item() > 1e-3  # non-uniform
         assert m.mean().item() == pytest.approx(1.12, abs=1e-3)  # zero-sum redistribution
 
-    def test_compute_sega_allocation_degenerate_is_uniform(self):
+    def test_compute_spectral_allocation_degenerate_is_uniform(self):
         energy = torch.linspace(1.0, 10.0, 64)
         freqs = 1.0 / (THETA ** (torch.arange(0, 56, 2).float() / 56))
-        m = compute_sega_allocation(energy, freqs, base_mscale=1.12, spread=0.0, alpha=0.15)
+        m = compute_spectral_allocation(energy, freqs, base_mscale=1.12, spread=0.0, alpha=0.15)
         assert torch.allclose(m, torch.full((28,), 1.12), atol=1e-6)
 
     def test_axis_profiles_shape(self):
@@ -333,24 +333,24 @@ class TestSegaHelpers:
         assert e_h.shape == (64,) and e_w.shape == (64,)
 
 
-class TestSegaPosEmbed:
+class TestSpectralPosEmbed:
     def test_noop_at_trained_resolution(self):
         # SEGA must be a no-op at/below 1024x1024, identical to plain rope ("base").
-        sega = _DyPEPosEmbed(THETA, AXES_DIM, method="sega")
+        spectral_pe = _DyPEPosEmbed(THETA, AXES_DIM, method="spectral")
         base = _DyPEPosEmbed(THETA, AXES_DIM, method="base")
         for patch_grid in (32, BASE_PATCHES):
             ids = build_flux_style_ids(num_txt_tokens=8, patch_grid=patch_grid)
-            cs, _ = sega(ids)
+            cs, _ = spectral_pe(ids)
             cb, _ = base(ids)
             assert torch.equal(cs, cb)
 
     def test_engages_above_trained_resolution(self):
-        sega = _DyPEPosEmbed(THETA, AXES_DIM, method="sega")
+        spectral_pe = _DyPEPosEmbed(THETA, AXES_DIM, method="spectral")
         yarn = _DyPEPosEmbed(THETA, AXES_DIM, method="yarn")
         ids = build_flux_style_ids(num_txt_tokens=8, patch_grid=128)
 
         # Without spectral data, SEGA falls back to a uniform reference magnitude but still differs from YaRN.
-        cs, _ = sega(ids)
+        cs, _ = spectral_pe(ids)
         cy, _ = yarn(ids)
         assert cs.shape == cy.shape
         assert not torch.equal(cs, cy)
@@ -358,18 +358,18 @@ class TestSegaPosEmbed:
         assert torch.equal(cs[:, : AXES_DIM[0]], cy[:, : AXES_DIM[0]])
 
     def test_per_dim_mscale_is_non_uniform_with_spectral_data(self):
-        sega = _DyPEPosEmbed(THETA, AXES_DIM, method="sega")
+        spectral_pe = _DyPEPosEmbed(THETA, AXES_DIM, method="spectral")
         energy = torch.linspace(1.0, 10.0, 64)
-        sega.set_spectral_data(energy, energy, dynamic_spread=1.0, target_res_h=2048, target_res_w=2048)
-        m = sega._compute_sega_mscale(1, AXES_DIM[1], scale=128 / BASE_PATCHES, device=torch.device("cpu"))
+        spectral_pe.set_spectral_data(energy, energy, dynamic_spread=1.0, target_res_h=2048, target_res_w=2048)
+        m = spectral_pe._compute_spectral_mscale(1, AXES_DIM[1], scale=128 / BASE_PATCHES, device=torch.device("cpu"))
         assert m.shape == (AXES_DIM[1] // 2,)
         assert (m.max() - m.min()).item() > 1e-3
 
 
-class TestSegaHook:
-    def test_sega_reads_latent_and_sets_spectral_data(self):
+class TestSpectralHook:
+    def test_spectral_reads_latent_and_sets_spectral_data(self):
         model = DummyFluxLikeTransformerWithLatent()
-        apply_dype(model, method="sega")
+        apply_dype(model, method="spectral")
         assert len(model._forward_pre_hooks) == 1
 
         G = 96  # > 64 base patches so SEGA engages
