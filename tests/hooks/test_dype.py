@@ -243,6 +243,29 @@ class TestDypeHook:
         model(hidden_states, None, None, torch.tensor(0.5), ids[8:], ids[:8])
         assert model.pos_embed.current_timestep == 0.5
 
+    def test_timestep_fed_via_native_forward_pre_hook(self):
+        # Regression: accelerate's `enable_model_cpu_offload` re-wraps the transformer's `forward`, which bypasses
+        # `ModelHook.pre_forward`. DyPE therefore feeds the timestep with a native forward pre-hook, which
+        # `nn.Module._call_impl` runs before `forward` regardless of how `forward` is subsequently wrapped.
+        model = DummyFluxLikeTransformer()
+        assert len(model._forward_pre_hooks) == 0
+
+        apply_dype(model)
+        assert len(model._forward_pre_hooks) == 1  # native pre-hook installed by initialize_hook
+
+        # The timestep must still reach the embedding when `forward` is replaced by an external wrapper.
+        import functools
+
+        inner_forward = model.forward
+        model.forward = functools.update_wrapper(lambda *a, **k: inner_forward(*a, **k), inner_forward)
+        ids = build_flux_style_ids(num_txt_tokens=8, patch_grid=8)
+        model(torch.randn(8, 4), img_ids=ids[8:], txt_ids=ids[:8], timestep=torch.tensor([0.4]))
+        assert model.pos_embed.current_timestep == pytest.approx(0.4)
+
+        registry = HookRegistry.check_if_exists_or_initialize(model)
+        registry.remove_hook("dype_hook")
+        assert len(model._forward_pre_hooks) == 0  # torn down on removal
+
     def test_apply_dype_validation(self):
         with pytest.raises(ValueError, match='must be "yarn"'):
             apply_dype(DummyFluxLikeTransformer(), method="ntk")

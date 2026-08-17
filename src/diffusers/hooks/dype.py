@@ -275,7 +275,13 @@ class _DyPEPosEmbed(torch.nn.Module):
 class DyPEHook(ModelHook):
     r"""
     A hook that swaps the positional embedding of a Flux-like transformer for a `_DyPEPosEmbed` and feeds it the
-    current (normalized) timestep at every forward pass, enabling training-free ultra-high-resolution generation.
+    current (normalized) diffusion timestep at every forward pass, enabling training-free ultra-high-resolution
+    generation.
+
+    The timestep is fed through a native `torch.nn.Module` forward pre-hook rather than `ModelHook.pre_forward`. This
+    keeps the timestep reaching the positional embedding even when the transformer's `forward` is additionally wrapped
+    by another mechanism -- most importantly accelerate's `enable_model_cpu_offload`, which re-wraps `forward` and
+    would otherwise bypass `pre_forward`.
     """
 
     def __init__(self, method: str = "yarn", dype: bool = True) -> None:
@@ -284,6 +290,7 @@ class DyPEHook(ModelHook):
         self.method = method
         self.dype = dype
         self._original_pos_embed = None
+        self._timestep_hook_handle = None
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         pos_embed = getattr(module, "pos_embed", None)
@@ -300,23 +307,28 @@ class DyPEHook(ModelHook):
             method=self.method,
             dype=self.dype,
         )
+
+        def _feed_timestep(mod, args, kwargs):
+            timestep = kwargs.get("timestep", None)
+            if timestep is None and len(args) > 3:
+                # `FluxTransformer2DModel.forward` receives (hidden_states, encoder_hidden_states,
+                # pooled_projections, timestep, ...) positionally when timestep is not passed as a kwarg.
+                timestep = args[3]
+            if timestep is not None:
+                if torch.is_tensor(timestep):
+                    timestep = timestep.flatten()[0]
+                mod.pos_embed.set_timestep(float(timestep))
+
+        self._timestep_hook_handle = module.register_forward_pre_hook(_feed_timestep, with_kwargs=True)
         return module
 
-    def pre_forward(self, module: torch.nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
-        timestep = kwargs.get("timestep", None)
-        if timestep is None and len(args) > 3:
-            # Stock `FluxTransformer2DModel.forward` receives (hidden_states, encoder_hidden_states,
-            # pooled_projections, timestep, ...) positionally when not passed as a kwarg.
-            timestep = args[3]
-
-        if timestep is not None:
-            if torch.is_tensor(timestep):
-                timestep = timestep.flatten()[0]
-            module.pos_embed.set_timestep(float(timestep))
-
-        return args, kwargs
-
+    # NOTE: the method name intentionally matches `ModelHook.deinitalize_hook` / `HookRegistry.remove_hook`, which
+    # are spelled without the second "i" in diffusers' hooks framework. Renaming to the correct spelling would stop
+    # this override from being called on removal.
     def deinitalize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
+        if self._timestep_hook_handle is not None:
+            self._timestep_hook_handle.remove()
+            self._timestep_hook_handle = None
         if self._original_pos_embed is not None:
             module.pos_embed = self._original_pos_embed
             self._original_pos_embed = None
@@ -346,10 +358,19 @@ def apply_dype(module: torch.nn.Module, method: str = "yarn", dype: bool = True)
     >>> from diffusers import FluxPipeline, apply_dype
 
     >>> pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-Krea-dev", torch_dtype=torch.bfloat16)
-    >>> pipe.to("cuda")
+    >>> pipe.enable_model_cpu_offload()
 
     >>> apply_dype(pipe.transformer)
-    >>> image = pipe("a photo of a cat", height=4096, width=4096, guidance_scale=4.5).images[0]
+
+    >>> # Above the trained resolution, also flatten the flow-matching shift schedule. The default FLUX schedule
+    >>> # grows the timestep shift `mu` with the image sequence length, which collapses the sigma schedule well
+    >>> # before 4K (the sampler spends nearly every step at pure noise). Pinning `base_shift == max_shift` keeps
+    >>> # `mu` constant so the sampler denoises normally. This is a pipeline-level setting; the DyPE hook only
+    >>> # governs the positional embedding.
+    >>> pipe.scheduler.register_to_config(base_shift=1.15, max_shift=1.15)
+
+    >>> prompt = "a photo of a cat"
+    >>> image = pipe(prompt, height=4096, width=4096, guidance_scale=4.5, num_inference_steps=28).images[0]
     ```
     """
 
