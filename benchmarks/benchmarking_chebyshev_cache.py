@@ -35,10 +35,32 @@ Usage:
 import argparse
 import csv
 import time
+from contextlib import contextmanager
 
 import torch
 
 from diffusers import ChebyshevCacheConfig, FluxPipeline, TaylorSeerCacheConfig
+
+
+@contextmanager
+def _cache_context(transformer, name="benchmark"):
+    """Set the cache context directly on every hooked module.
+
+    A fresh module traversal each call, so it is immune to the cached
+    child-registry list that ``CacheMixin.cache_context`` relies on — that list
+    is built on first use and is not rebuilt when hooks are added later, so any
+    ``cache_context`` call made before ``enable_cache`` (e.g. the no-cache
+    reference arm going through the pipeline) leaves later contexts unable to
+    reach the newly-hooked blocks ("No context is set").
+    """
+    modules = [m for m in transformer.modules() if hasattr(m, "_diffusers_hook")]
+    for m in modules:
+        m._diffusers_hook._set_context(name)
+    try:
+        yield
+    finally:
+        for m in modules:
+            m._diffusers_hook._set_context(None)
 
 
 CKPT_ID = "black-forest-labs/FLUX.1-dev"
@@ -73,21 +95,35 @@ def load_pipeline():
 
 
 def run_arm(pipe, prompts, num_inference_steps, seed, cache_config=None):
-    if cache_config is not None:
+    cached = cache_config is not None
+    if cached:
+        # Clear any cache left attached by a previous (possibly failed) arm.
+        if getattr(pipe.transformer, "is_cache_enabled", False):
+            pipe.transformer.disable_cache()
         pipe.transformer.enable_cache(cache_config)
 
-    images = []
-    start = time.perf_counter()
-    for i, prompt in enumerate(prompts):
+    def _generate(prompt, i):
         generator = torch.Generator(device="cuda").manual_seed(seed + i)
-        image = pipe(prompt, num_inference_steps=num_inference_steps, generator=generator).images[0]
-        images.append(image)
-    torch.cuda.synchronize()
-    latency = (time.perf_counter() - start) / len(prompts)
+        # Stateful cache hooks need a context, and per-prompt state (step counter
+        # + feature history) must be reset so it does not carry across prompts.
+        if cached:
+            pipe.transformer._reset_stateful_cache()
+            with _cache_context(pipe.transformer):
+                return pipe(prompt, num_inference_steps=num_inference_steps, generator=generator).images[0]
+        return pipe(prompt, num_inference_steps=num_inference_steps, generator=generator).images[0]
 
-    if cache_config is not None:
-        pipe.transformer.disable_cache()
-    return images, latency
+    try:
+        images = []
+        start = time.perf_counter()
+        for i, prompt in enumerate(prompts):
+            images.append(_generate(prompt, i))
+        torch.cuda.synchronize()
+        latency = (time.perf_counter() - start) / len(prompts)
+        return images, latency
+    finally:
+        # Always detach the cache, even on error, so the next arm starts clean.
+        if cached and getattr(pipe.transformer, "is_cache_enabled", False):
+            pipe.transformer.disable_cache()
 
 
 def psnr_vs_reference(images, reference_images):
