@@ -19,6 +19,7 @@ import torch
 from diffusers import ChebyshevCacheConfig, apply_chebyshev_cache
 from diffusers.hooks.chebyshev_cache import _CHEBYSHEV_CACHE_HOOK, ChebyshevCacheState
 from diffusers.models import ModelMixin
+from diffusers.models.cache_utils import CacheMixin
 
 
 class CountingBlock(torch.nn.Module):
@@ -33,7 +34,10 @@ class CountingBlock(torch.nn.Module):
         return hidden_states * 2.0
 
 
-class DummyTransformer(ModelMixin):
+class DummyTransformer(ModelMixin, CacheMixin):
+    # CacheMixin provides enable_cache / disable_cache / cache_context — real
+    # model classes (e.g. FluxTransformer2DModel) inherit both mixins, and the
+    # schedule tests below drive caching through that public API.
     def __init__(self):
         super().__init__()
         self.transformer_blocks = torch.nn.ModuleList([CountingBlock()])
@@ -222,6 +226,50 @@ class ChebyshevCacheStateTests(unittest.TestCase):
         state.reset()
         self.assertEqual(state.current_step, -1)
         self.assertEqual(state.feature_history, {})
+
+    def test_prediction_accumulates_in_factor_dtype_not_module_dtype(self):
+        # Features arrive in bf16 (the FLUX.1-dev setting) while
+        # cheb_factors_dtype=float32. The weighted sum must accumulate in
+        # float32 and cast to the module dtype only at the end — accumulating
+        # in bf16 amplifies the alternating-sign cancellation in the
+        # barycentric weights and defeats the stability rationale.
+        torch.manual_seed(0)
+        state = ChebyshevCacheState(cheb_factors_dtype=torch.float32, cheb_order=6)
+        steps = [0, 3, 6, 9]
+        feats = {s: (torch.randn(1024) * 40.0).to(torch.bfloat16) for s in steps}
+        for s in steps:
+            state.current_step = s
+            state.update((feats[s],))
+        state.current_step = 7
+        (out,) = state.predict()
+        self.assertEqual(out.dtype, torch.bfloat16, "output must be cast back to the module dtype")
+
+        weights = ChebyshevCacheState._barycentric_weights(steps, 7, torch.device("cpu"))
+        gt = sum(feats[s].double() * w for s, w in zip(steps, weights))
+        # Differential check: the implementation must be closer to the high-
+        # precision truth than a bf16-accumulated sum would be.
+        acc_bf16 = torch.zeros(1024, dtype=torch.bfloat16)
+        for s, w in zip(steps, weights):
+            acc_bf16 = acc_bf16 + feats[s].to(torch.bfloat16) * w.to(torch.bfloat16)
+        err_impl = (out.double() - gt).abs().mean().item()
+        err_bf16 = (acc_bf16.double() - gt).abs().mean().item()
+        self.assertLess(err_impl, err_bf16, f"impl err {err_impl} not better than bf16-accum {err_bf16}")
+
+    def test_predict_before_any_compute_falls_back_to_full_forward(self):
+        # disable_cache_before_step=0 must NOT crash: with no history recorded,
+        # has_recorded() is False so the hook forces a full compute at step 0.
+        model = DummyTransformer()
+        config = ChebyshevCacheConfig(
+            cache_interval=3,
+            disable_cache_before_step=0,
+            cache_identifiers=["^transformer_blocks.*"],
+        )
+        apply_chebyshev_cache(model, config)
+        block = model.transformer_blocks[0]
+        with model.cache_context("zero_warmup"):
+            out = model(torch.ones(1, 4))  # step 0 — must compute, not predict
+        self.assertEqual(block.compute_count, 1)
+        self.assertFalse(torch.isnan(out).any())
 
 
 if __name__ == "__main__":

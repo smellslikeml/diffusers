@@ -142,6 +142,16 @@ class ChebyshevCacheState:
         self.inactive_shapes = None
         self.device = None
 
+    def has_recorded(self) -> bool:
+        """True once at least one full compute has populated predictable state.
+
+        Guards against predicting before any history exists (active modules) or
+        before the recorded output shapes are known (inactive modules).
+        """
+        if self.is_inactive:
+            return self.inactive_shapes is not None
+        return bool(self.feature_history)
+
     def update(
         self,
         outputs: tuple[torch.Tensor, ...],
@@ -225,6 +235,13 @@ class ChebyshevCacheState:
                     )
                 )
         else:
+            # Accumulate the weighted sum in cheb_factors_dtype (float32 by
+            # default), not the module's compute dtype. The barycentric weights
+            # alternate in sign, so the sum involves cancellation that a bf16 /
+            # fp16 module dtype would amplify — accumulating in bf16 would defeat
+            # the numerical-stability rationale for storing history in float32.
+            # Cast to the module dtype only once, at the end.
+            acc_dtype = self.cheb_factors_dtype or torch.float32
             for i in range(len(self.feature_history)):
                 output_dtype = self.module_dtypes[i]
                 history = self.feature_history[i]
@@ -233,11 +250,11 @@ class ChebyshevCacheState:
                 # `num_steps - step - 1` (`cheb_formula.v2`, ~L91-109). This hook counts denoising steps forward
                 # from 0 (same convention as `TaylorSeerState`), so no remap is applied here.
                 weights = self._barycentric_weights(history_steps, self.current_step, self.device)
-                output = torch.zeros_like(history[0][1], dtype=output_dtype)
+                output = torch.zeros_like(history[0][1], dtype=acc_dtype)
                 # Weighted-sum prediction, mirroring `cheb_formula.v2` (reference ~L97-110).
                 for weight, (_, feature) in zip(weights, history):
-                    output = output + feature.to(output_dtype) * weight.to(output_dtype)
-                outputs.append(output)
+                    output = output + feature.to(acc_dtype) * weight.to(acc_dtype)
+                outputs.append(output.to(output_dtype))
         return outputs
 
 
@@ -269,18 +286,28 @@ class ChebyshevCacheHook(ModelHook):
         self.state_manager.reset()
 
     @torch.compiler.disable
-    def _measure_should_compute(self) -> bool:
+    def _measure_should_compute(self) -> tuple[bool, "ChebyshevCacheState"]:
         state: ChebyshevCacheState = self.state_manager.get_state()
         state.current_step += 1
         current_step = state.current_step
         is_warmup_phase = current_step < self.disable_cache_before_step
-        is_compute_interval = (current_step - self.disable_cache_before_step - 1) % self.cache_interval == 0
+        # cache_interval <= 0 disables prediction entirely (every post-warmup
+        # step recomputes) rather than raising ZeroDivisionError on the modulo.
+        is_compute_interval = (
+            self.cache_interval <= 0
+            or (current_step - self.disable_cache_before_step - 1) % self.cache_interval == 0
+        )
         is_cooldown_phase = self.disable_cache_after_step is not None and current_step >= self.disable_cache_after_step
         should_compute = is_warmup_phase or is_compute_interval or is_cooldown_phase
         return should_compute, state
 
     def new_forward(self, module: torch.nn.Module, *args, **kwargs):
         should_compute, state = self._measure_should_compute()
+        # Never predict before a full compute has populated the state (e.g. a
+        # config with disable_cache_before_step=0 would otherwise predict at
+        # step 0 with an empty history and raise). Fall back to a full forward.
+        if not should_compute and not state.has_recorded():
+            should_compute = True
         if should_compute:
             outputs = self.fn_ref.original_forward(*args, **kwargs)
             wrapped_outputs = (outputs,) if isinstance(outputs, torch.Tensor) else outputs
