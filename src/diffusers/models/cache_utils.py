@@ -67,12 +67,14 @@ class CacheMixin:
         """
 
         from ..hooks import (
+            ChebyshevCacheConfig,
             FasterCacheConfig,
             FirstBlockCacheConfig,
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
+            apply_chebyshev_cache,
             apply_faster_cache,
             apply_first_block_cache,
             apply_mag_cache,
@@ -86,7 +88,9 @@ class CacheMixin:
                 f"Caching has already been enabled with {type(self._cache_config)}. To apply a new caching technique, please disable the existing one first."
             )
 
-        if isinstance(config, FasterCacheConfig):
+        if isinstance(config, ChebyshevCacheConfig):
+            apply_chebyshev_cache(self, config)
+        elif isinstance(config, FasterCacheConfig):
             apply_faster_cache(self, config)
         elif isinstance(config, FirstBlockCacheConfig):
             apply_first_block_cache(self, config)
@@ -105,6 +109,7 @@ class CacheMixin:
 
     def disable_cache(self) -> None:
         from ..hooks import (
+            ChebyshevCacheConfig,
             FasterCacheConfig,
             FirstBlockCacheConfig,
             HookRegistry,
@@ -113,6 +118,7 @@ class CacheMixin:
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
         )
+        from ..hooks.chebyshev_cache import _CHEBYSHEV_CACHE_HOOK
         from ..hooks.faster_cache import _FASTER_CACHE_BLOCK_HOOK, _FASTER_CACHE_DENOISER_HOOK
         from ..hooks.first_block_cache import _FBC_BLOCK_HOOK, _FBC_LEADER_BLOCK_HOOK
         from ..hooks.mag_cache import _MAG_CACHE_BLOCK_HOOK, _MAG_CACHE_LEADER_BLOCK_HOOK
@@ -125,7 +131,9 @@ class CacheMixin:
             return
 
         registry = HookRegistry.check_if_exists_or_initialize(self)
-        if isinstance(self._cache_config, FasterCacheConfig):
+        if isinstance(self._cache_config, ChebyshevCacheConfig):
+            registry.remove_hook(_CHEBYSHEV_CACHE_HOOK, recurse=True)
+        elif isinstance(self._cache_config, FasterCacheConfig):
             registry.remove_hook(_FASTER_CACHE_DENOISER_HOOK, recurse=True)
             registry.remove_hook(_FASTER_CACHE_BLOCK_HOOK, recurse=True)
         elif isinstance(self._cache_config, FirstBlockCacheConfig):

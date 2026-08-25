@@ -112,6 +112,34 @@ config = TaylorSeerCacheConfig(
 pipe.transformer.enable_cache(config)
 ```
 
+## ChebBooster (Chebyshev) Cache
+
+[ChebBooster](https://arxiv.org/abs/2608.23429) uses the same cache machinery as TaylorSeer Cache but replaces the Taylor-series extrapolation with a numerically-stable barycentric Chebyshev interpolation over a rolling window of full-compute activations. Taylor extrapolation degrades as the order and prediction horizon grow; the Chebyshev interpolant stays stable at higher orders, which the authors report translates into better quality at the same speedup (up to 3.68x latency and 5.12x FLOPs reduction on DiT-XL/2, PixArt-Sigma, and FLUX.1-dev, per the paper).
+
+To enable Chebyshev Cache, create a [`ChebyshevCacheConfig`] and pass it to your pipeline's transformer:
+
+- `cache_interval`: Number of steps to reuse cached outputs before performing a full forward pass
+- `disable_cache_before_step`: Initial steps that use full computations to gather the interpolation history window
+- `cheb_order`: Maximum number of full-compute activations kept in the rolling history window (the paper's `n`, defaults to `6`)
+
+```python
+import torch
+from diffusers import FluxPipeline, ChebyshevCacheConfig
+
+pipe = FluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-dev",
+    torch_dtype=torch.bfloat16,
+).to("cuda")
+
+config = ChebyshevCacheConfig(
+    cache_interval=5,
+    cheb_order=6,
+    disable_cache_before_step=3,
+    cheb_factors_dtype=torch.float32,
+)
+pipe.transformer.enable_cache(config)
+```
+
 ## MagCache
 
 [MagCache](https://github.com/Zehong-Ma/MagCache) accelerates inference by skipping transformer blocks based on the magnitude of the residual update. It observes that the magnitude of updates (Output - Input) decays predictably over the diffusion process. By accumulating an "error budget" based on pre-computed magnitude ratios, it dynamically decides when to skip computation and reuse the previous residual.

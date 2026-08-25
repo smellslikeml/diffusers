@@ -19,12 +19,14 @@ import pytest
 import torch
 
 from diffusers.hooks import (
+    ChebyshevCacheConfig,
     FasterCacheConfig,
     FirstBlockCacheConfig,
     MagCacheConfig,
     PyramidAttentionBroadcastConfig,
     TaylorSeerCacheConfig,
 )
+from diffusers.hooks.chebyshev_cache import _CHEBYSHEV_CACHE_HOOK
 from diffusers.hooks.faster_cache import _FASTER_CACHE_BLOCK_HOOK, _FASTER_CACHE_DENOISER_HOOK
 from diffusers.hooks.first_block_cache import _FBC_BLOCK_HOOK, _FBC_LEADER_BLOCK_HOOK
 from diffusers.hooks.mag_cache import _MAG_CACHE_BLOCK_HOOK, _MAG_CACHE_LEADER_BLOCK_HOOK
@@ -750,4 +752,126 @@ class TaylorSeerCacheTesterMixin(TaylorSeerCacheConfigMixin, CacheTesterMixin):
 
     @require_cache_mixin
     def test_taylorseer_cache_reset_stateful_cache(self):
+        self._test_reset_stateful_cache()
+
+
+@is_cache
+class ChebyshevCacheConfigMixin:
+    """
+    Base mixin providing ChebyshevCache config.
+
+    Expected class attributes:
+        - model_class: The model class to test (must use CacheMixin)
+    """
+
+    # Default ChebyshevCache config - can be overridden by subclasses.
+    # Uses a low cache_interval and disable_cache_before_step=1 so the second
+    # inference step is always predicted, which is required by _test_cache_inference.
+    CHEBYSHEV_CACHE_CONFIG = {
+        "cache_interval": 3,
+        "disable_cache_before_step": 1,
+        "cheb_order": 2,
+    }
+
+    def _get_cache_config(self):
+        return ChebyshevCacheConfig(**self.CHEBYSHEV_CACHE_CONFIG)
+
+    def _get_hook_names(self):
+        return [_CHEBYSHEV_CACHE_HOOK]
+
+
+@is_cache
+class ChebyshevCacheTesterMixin(ChebyshevCacheConfigMixin, CacheTesterMixin):
+    """
+    Mixin class for testing ChebyshevCache on models.
+
+    Expected class attributes:
+        - model_class: The model class to test (must use CacheMixin)
+
+    Expected methods to be implemented by subclasses:
+        - get_init_dict(): Returns dict of arguments to initialize the model
+        - get_dummy_inputs(): Returns dict of inputs to pass to the model forward pass
+
+    Pytest mark: cache
+        Use `pytest -m "not cache"` to skip these tests
+    """
+
+    @torch.no_grad()
+    def _test_cache_inference(self):
+        """Test that model can run inference with Chebyshev cache enabled (requires cache_context)."""
+        init_dict = self.get_init_dict()
+        inputs_dict = self.get_dummy_inputs()
+        model = self.model_class(**init_dict).to(torch_device)
+        model.eval()
+
+        config = self._get_cache_config()
+        model.enable_cache(config)
+
+        # Chebyshev cache requires cache_context to be set for inference
+        with model.cache_context("chebyshev_test"):
+            # First pass populates the cache
+            _ = model(**inputs_dict, return_dict=False)[0]
+
+            # Create modified inputs for second pass
+            inputs_dict_step2 = inputs_dict.copy()
+            if self.cache_input_key in inputs_dict_step2:
+                inputs_dict_step2[self.cache_input_key] = inputs_dict_step2[self.cache_input_key] + torch.randn_like(
+                    inputs_dict_step2[self.cache_input_key]
+                )
+
+            # Second pass - Chebyshev cache should use interpolated predictions from the history window
+            output_with_cache = model(**inputs_dict_step2, return_dict=False)[0]
+
+        assert output_with_cache is not None, "Model output should not be None with cache enabled."
+        assert not torch.isnan(output_with_cache).any(), "Model output contains NaN with cache enabled."
+
+        # Run same inputs without cache to compare
+        model.disable_cache()
+        output_without_cache = model(**inputs_dict_step2, return_dict=False)[0]
+
+        # Cached output should be different from non-cached output (due to approximation)
+        assert not torch.allclose(output_without_cache, output_with_cache, atol=1e-5), (
+            "Cached output should be different from non-cached output due to cache approximation."
+        )
+
+    @torch.no_grad()
+    def _test_reset_stateful_cache(self):
+        """Test that _reset_stateful_cache resets the Chebyshev cache state (requires cache_context)."""
+        init_dict = self.get_init_dict()
+        inputs_dict = self.get_dummy_inputs()
+        model = self.model_class(**init_dict).to(torch_device)
+        model.eval()
+
+        config = self._get_cache_config()
+        model.enable_cache(config)
+
+        with model.cache_context("chebyshev_test"):
+            _ = model(**inputs_dict, return_dict=False)[0]
+
+        model._reset_stateful_cache()
+
+        model.disable_cache()
+
+    @require_cache_mixin
+    def test_chebyshev_cache_enable_disable_state(self):
+        self._test_cache_enable_disable_state()
+
+    @require_cache_mixin
+    def test_chebyshev_cache_double_enable_raises_error(self):
+        self._test_cache_double_enable_raises_error()
+
+    @require_cache_mixin
+    def test_chebyshev_cache_hooks_registered(self):
+        self._test_cache_hooks_registered()
+
+    @require_cache_mixin
+    def test_chebyshev_cache_inference(self):
+        self._test_cache_inference()
+
+    @require_cache_mixin
+    def test_chebyshev_cache_context_manager(self):
+        self._test_cache_context_manager()
+
+    @require_cache_mixin
+    def test_chebyshev_cache_reset_stateful_cache(self):
         self._test_reset_stateful_cache()

@@ -1,6 +1,8 @@
 from .attention import AttentionBackendTesterMixin, AttentionTesterMixin
 from .cache import (
     CacheTesterMixin,
+    ChebyshevCacheConfigMixin,
+    ChebyshevCacheTesterMixin,
     FasterCacheConfigMixin,
     FasterCacheTesterMixin,
     FirstBlockCacheConfigMixin,
@@ -54,6 +56,8 @@ __all__ = [
     "BitsAndBytesConfigMixin",
     "BitsAndBytesTesterMixin",
     "CacheTesterMixin",
+    "ChebyshevCacheConfigMixin",
+    "ChebyshevCacheTesterMixin",
     "ContextParallelTesterMixin",
     "ContextParallelAttentionBackendsTesterMixin",
     "CPUOffloadTesterMixin",

@@ -31,6 +31,7 @@ from ..testing_utils import (
     BaseModelTesterConfig,
     BitsAndBytesCompileTesterMixin,
     BitsAndBytesTesterMixin,
+    ChebyshevCacheTesterMixin,
     ContextParallelAttentionBackendsTesterMixin,
     ContextParallelTesterMixin,
     FasterCacheTesterMixin,
@@ -529,3 +530,7 @@ class TestFluxTransformerMagCache(FluxTransformerTesterConfig, MagCacheTesterMix
 
 class TestFluxTransformerTaylorSeerCache(FluxTransformerTesterConfig, TaylorSeerCacheTesterMixin):
     """TaylorSeerCache tests for Flux Transformer."""
+
+
+class TestFluxTransformerChebyshevCache(FluxTransformerTesterConfig, ChebyshevCacheTesterMixin):
+    """ChebyshevCache tests for Flux Transformer."""
