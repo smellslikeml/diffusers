@@ -272,6 +272,21 @@ class SmoothedEnergyGuidanceConfig(metaclass=DummyObject):
         requires_backends(cls, ["torch"])
 
 
+class ChebyshevCacheConfig(metaclass=DummyObject):
+    _backends = ["torch"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+    @classmethod
+    def from_config(cls, *args, **kwargs):
+        requires_backends(cls, ["torch"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["torch"])
+
+
 class TaylorSeerCacheConfig(metaclass=DummyObject):
     _backends = ["torch"]
 
@@ -300,6 +315,10 @@ class TextKVCacheConfig(metaclass=DummyObject):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         requires_backends(cls, ["torch"])
+
+
+def apply_chebyshev_cache(*args, **kwargs):
+    requires_backends(apply_chebyshev_cache, ["torch"])
 
 
 def apply_faster_cache(*args, **kwargs):
