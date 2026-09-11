@@ -67,12 +67,14 @@ class CacheMixin:
         """
 
         from ..hooks import (
+            ChebyshevCacheConfig,
             FasterCacheConfig,
             FirstBlockCacheConfig,
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
+            apply_chebyshev_cache,
             apply_faster_cache,
             apply_first_block_cache,
             apply_mag_cache,
@@ -98,6 +100,8 @@ class CacheMixin:
             apply_pyramid_attention_broadcast(self, config)
         elif isinstance(config, TaylorSeerCacheConfig):
             apply_taylorseer_cache(self, config)
+        elif isinstance(config, ChebyshevCacheConfig):
+            apply_chebyshev_cache(self, config)
         else:
             raise ValueError(f"Cache config {type(config)} is not supported.")
 
@@ -105,6 +109,7 @@ class CacheMixin:
 
     def disable_cache(self) -> None:
         from ..hooks import (
+            ChebyshevCacheConfig,
             FasterCacheConfig,
             FirstBlockCacheConfig,
             HookRegistry,
@@ -113,6 +118,7 @@ class CacheMixin:
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
         )
+        from ..hooks.chebyshev_cache import _CHEBYSHEV_CACHE_HOOK
         from ..hooks.faster_cache import _FASTER_CACHE_BLOCK_HOOK, _FASTER_CACHE_DENOISER_HOOK
         from ..hooks.first_block_cache import _FBC_BLOCK_HOOK, _FBC_LEADER_BLOCK_HOOK
         from ..hooks.mag_cache import _MAG_CACHE_BLOCK_HOOK, _MAG_CACHE_LEADER_BLOCK_HOOK
@@ -141,6 +147,8 @@ class CacheMixin:
             registry.remove_hook(_TEXT_KV_CACHE_BLOCK_HOOK, recurse=True)
         elif isinstance(self._cache_config, TaylorSeerCacheConfig):
             registry.remove_hook(_TAYLORSEER_CACHE_HOOK, recurse=True)
+        elif isinstance(self._cache_config, ChebyshevCacheConfig):
+            registry.remove_hook(_CHEBYSHEV_CACHE_HOOK, recurse=True)
         else:
             raise ValueError(f"Cache config {type(self._cache_config)} is not supported.")
 
