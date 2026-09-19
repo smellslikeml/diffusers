@@ -17,6 +17,12 @@ import torch
 
 from diffusers import DualCacheConfig, apply_dual_cache
 from diffusers.hooks._helpers import TransformerBlockMetadata, TransformerBlockRegistry
+from diffusers.hooks.dual_cache import (
+    _MODE_AGGRESSIVE,
+    _MODE_CONSERVATIVE,
+    _MODE_FRESH,
+    DualCacheBlockHook,
+)
 from diffusers.models import ModelMixin
 from diffusers.models.cache_utils import CacheMixin
 from diffusers.utils import logging
@@ -66,7 +72,7 @@ def test_dual_cache_config_validation():
 
 
 def test_dual_cache_schedule():
-    """Exercise a full fresh -> aggressive -> conservative cycle through the DuCa hooks."""
+    """Exercise a full fresh -> conservative -> aggressive cycle through the DuCa hooks."""
     # 4 blocks, each doubles: a full forward computes input * 16.
     model = DummyTransformer(num_blocks=4)
     # conservative_fraction=0.5 -> recompute the first 2 blocks on conservative steps.
@@ -75,19 +81,20 @@ def test_dual_cache_schedule():
     _set_context(model, "test_context")
 
     # Step 0 (FRESH): full compute. Input 1 -> 16.
-    # full_residual = 16 - 1 = 15 (across all 4 blocks).
+    # noise (cached final output) = 16.
     # deep_residual = 16 - 4 = 12 (blocks 2..3, since input to block 2 during fresh is 1*2*2 = 4).
     out0 = model(torch.tensor([[[1.0]]]))
     assert torch.allclose(out0, torch.tensor([[[16.0]]]))
 
-    # Step 1 (AGGRESSIVE): skip everything, reuse full_residual. Input 2 -> 2 + 15 = 17.
-    out1 = model(torch.tensor([[[2.0]]]))
-    assert torch.allclose(out1, torch.tensor([[[17.0]]])), f"aggressive step got {out1.item()}"
+    # Step 1 (CONSERVATIVE): recompute first 2 blocks then reuse deep_residual.
+    # Input 3 -> blocks 0,1 compute -> 3*2*2 = 12; + deep_residual(12) = 24. noise updated to 24.
+    out1 = model(torch.tensor([[[3.0]]]))
+    assert torch.allclose(out1, torch.tensor([[[24.0]]])), f"conservative step got {out1.item()}"
 
-    # Step 2 (CONSERVATIVE): recompute first 2 blocks then reuse deep_residual.
-    # Input 3 -> blocks 0,1 compute -> 3*2*2 = 12; + deep_residual(12) = 24.
-    out2 = model(torch.tensor([[[3.0]]]))
-    assert torch.allclose(out2, torch.tensor([[[24.0]]])), f"conservative step got {out2.item()}"
+    # Step 2 (AGGRESSIVE): skip every block and return the entire cached output, ignoring the input.
+    # Input 2 is ignored -> output is the cached noise from step 1 = 24.
+    out2 = model(torch.tensor([[[2.0]]]))
+    assert torch.allclose(out2, torch.tensor([[[24.0]]])), f"aggressive step got {out2.item()}"
 
     # Step 3 (FRESH again, cycle restart): full compute. Input 5 -> 80.
     out3 = model(torch.tensor([[[5.0]]]))
@@ -102,9 +109,32 @@ def test_dual_cache_warmup_forces_compute():
     _set_context(model, "test_context")
 
     model(torch.tensor([[[1.0]]]))  # step 0 (warmup -> fresh)
-    # step 1 would be aggressive without warmup; warmup forces full compute: 2 -> 32.
+    # step 1 would be conservative without warmup; warmup forces full compute: 2 -> 32.
     out1 = model(torch.tensor([[[2.0]]]))
     assert torch.allclose(out1, torch.tensor([[[32.0]]])), f"warmup step got {out1.item()}"
+
+
+def test_dual_cache_adaptive_schedule():
+    """With num_inference_steps set, the fresh-step period follows the reference force scheduler."""
+    num_steps = 100
+    hook = DualCacheBlockHook(
+        state_manager=None,
+        config=DualCacheConfig(cache_interval=4, num_inference_steps=num_steps),
+        block_index=0,
+        num_blocks=4,
+        split_index=2,
+    )
+
+    # The period is adaptive rather than the fixed cache_interval.
+    assert hook._fresh_interval(0) != hook._fresh_interval(num_steps - 1)
+
+    # In the cache-sensitive 20-40% window the threshold is forced to 2: fresh on even steps,
+    # conservative on odd steps, and never aggressive.
+    for step in range(int(num_steps * 0.2), int(num_steps * 0.4)):
+        assert hook._fresh_interval(step) == 2
+        expected = _MODE_FRESH if step % 2 == 0 else _MODE_CONSERVATIVE
+        assert hook._decide_mode(step) == expected
+        assert hook._decide_mode(step) != _MODE_AGGRESSIVE
 
 
 def test_dual_cache_enable_disable_via_cache_mixin():

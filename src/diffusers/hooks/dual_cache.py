@@ -16,12 +16,18 @@ r"""
 Dual Feature Caching (DuCa) for Diffusion Transformers.
 
 Adapted from "Accelerating Diffusion Transformers with Dual Feature Caching"
-(https://huggingface.co/papers/2412.18911). DuCa runs a cyclic caching schedule of period ``cache_interval``: each cycle
-starts with a *fresh* step that fully computes and caches the transformer residual, followed by alternating *aggressive*
-steps (skip every block and reuse the full cached residual) and *conservative* steps (recompute a subset of blocks to
-correct the drift accumulated by aggressive skipping, reusing the cached residual for the remaining blocks). The key
-insight ported here is DuCa's dual schedule: aggressive caching is cheap but drifts, and interleaved conservative
-caching corrects that drift, giving a better speed/quality trade-off than a single fixed caching strategy.
+(https://huggingface.co/papers/2412.18911). DuCa runs a cyclic caching schedule: each cycle starts with a *fresh* step
+that fully computes and caches the transformer output, followed by alternating *conservative* steps (recompute a subset
+of blocks to correct drift, reusing the cached residual for the remaining blocks) and *aggressive* steps (skip every
+block and reuse the entire cached output from the prior step). Following the reference, the conservative step comes first
+after each fresh step. The key insight ported here is DuCa's dual schedule: aggressive caching is cheap but drifts, and
+interleaved conservative caching corrects that drift, giving a better speed/quality trade-off than a single fixed
+caching strategy.
+
+The period between fresh steps is adaptive: matching the reference's force scheduler, the threshold is scaled by a
+linear step-weight across the denoising trajectory and is forced to ``2`` inside the cache-sensitive 20-40% step window.
+This adaptive schedule is only active when ``num_inference_steps`` is supplied; otherwise DuCa falls back to a fixed
+period of ``cache_interval``.
 
 Adaptation note: the paper's conservative step selects *tokens* to recompute via a value-norm criterion (the
 flash-attention-friendly "V-caching" estimator). That token-wise estimator is replaced here with a parameter-free,
@@ -32,7 +38,7 @@ interface used by the other cache hooks in this repo.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 
@@ -59,9 +65,10 @@ class DualCacheConfig:
 
     Args:
         cache_interval (`int`, defaults to `3`):
-            The period `N` of the caching cycle. Each cycle is one *fresh* (full-compute) step followed by `N - 1` cache
-            steps that alternate *aggressive* and *conservative* caching. `N = 3` reproduces the paper's default
-            fresh -> aggressive -> conservative pattern.
+            The base period `N` of the caching cycle (the reference's ``fresh_threshold``). Each cycle is one *fresh*
+            (full-compute) step followed by `N - 1` cache steps that alternate *conservative* and *aggressive* caching.
+            `N = 3` reproduces the paper's default fresh -> conservative -> aggressive pattern. When `num_inference_steps`
+            is set, this is the base value scaled by the adaptive force scheduler.
         conservative_fraction (`float`, defaults to `0.5`):
             The fraction of leading transformer blocks recomputed on a conservative step (the block-wise proxy for the
             paper's token-wise V-caching). The remaining deeper blocks reuse their cached residual contribution. Must be
@@ -69,11 +76,16 @@ class DualCacheConfig:
         warmup_steps (`int`, defaults to `0`):
             The number of initial steps that are always fully computed before caching kicks in. Larger values trade
             speed for stability on the early, high-variance steps.
+        num_inference_steps (`int`, *optional*):
+            The total number of denoising steps. When provided, the fresh-step period is varied across the trajectory by
+            the reference's linear step-weight force scheduler and forced to `2` inside the cache-sensitive 20-40% step
+            window. When `None`, a fixed period of `cache_interval` is used.
     """
 
     cache_interval: int = 3
     conservative_fraction: float = 0.5
     warmup_steps: int = 0
+    num_inference_steps: Optional[int] = None
 
     def __post_init__(self):
         if self.cache_interval < 1:
@@ -82,6 +94,8 @@ class DualCacheConfig:
             raise ValueError(f"`conservative_fraction` must be in the open interval (0, 1), got {self.conservative_fraction}.")
         if self.warmup_steps < 0:
             raise ValueError(f"`warmup_steps` must be non-negative, got {self.warmup_steps}.")
+        if self.num_inference_steps is not None and self.num_inference_steps < 1:
+            raise ValueError(f"`num_inference_steps` must be a positive integer, got {self.num_inference_steps}.")
 
 
 def _residual(output: torch.Tensor, base: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -126,21 +140,18 @@ class DualCacheState(BaseState):
         self.step_index: int = 0
         # Caching mode selected by the head block for the current forward pass.
         self.mode: str = _MODE_FRESH
-        # Input to the first (head) block; base for the full residual.
-        self.head_input: Union[torch.Tensor, Tuple[torch.Tensor, ...]] = None
         # Input to the split block during a fresh step; base for the deep residual.
         self.fresh_split_input: torch.Tensor = None
-        # Cached residual across all blocks (reused by aggressive steps).
-        self.full_residual: torch.Tensor = None
+        # Cached final block output from the prior step (reused wholesale by aggressive steps).
+        self.noise: torch.Tensor = None
         # Cached residual across the deep (skipped) blocks only (reused by conservative steps).
         self.deep_residual: torch.Tensor = None
 
     def reset(self):
         self.step_index = 0
         self.mode = _MODE_FRESH
-        self.head_input = None
         self.fresh_split_input = None
-        self.full_residual = None
+        self.noise = None
         self.deep_residual = None
 
 
@@ -184,15 +195,30 @@ class DualCacheBlockHook(ModelHook):
         ret_list[self._metadata.return_encoder_hidden_states_index] = encoder_hidden_states
         return tuple(ret_list)
 
+    def _fresh_interval(self, step: int) -> int:
+        """The period between fresh steps for ``step``: adaptive when ``num_inference_steps`` is set, else fixed."""
+        cfg = self.config
+        num_steps = cfg.num_inference_steps
+        if not num_steps:
+            return cfg.cache_interval
+        # Linear step-weight force scheduler (DuCa): cache more early, refresh more often late.
+        linear_step_weight = 0.4
+        step_factor = 1.0 + linear_step_weight - 2.0 * linear_step_weight * step / num_steps
+        threshold = int(round(cfg.cache_interval / step_factor))
+        # The model is most cache-sensitive in the 20-40% step window; force a short refresh period there.
+        if int(num_steps * 0.2) <= step < int(num_steps * 0.4):
+            threshold = 2
+        return max(1, threshold)
+
     def _decide_mode(self, step: int) -> str:
         cfg = self.config
         if self.num_blocks < 2 or step < cfg.warmup_steps:
             return _MODE_FRESH
-        position = step % cfg.cache_interval
+        position = step % self._fresh_interval(step)
         if position == 0:
             return _MODE_FRESH
-        # After each fresh step, alternate aggressive (odd) and conservative (even) cache steps.
-        return _MODE_AGGRESSIVE if position % 2 == 1 else _MODE_CONSERVATIVE
+        # After each fresh step, alternate conservative (odd) and aggressive (even) cache steps.
+        return _MODE_CONSERVATIVE if position % 2 == 1 else _MODE_AGGRESSIVE
 
     @torch.compiler.disable
     def new_forward(self, module: torch.nn.Module, *args, **kwargs):
@@ -201,7 +227,6 @@ class DualCacheBlockHook(ModelHook):
         state: DualCacheState = self.state_manager.get_state()
 
         if self.is_head:
-            state.head_input = self._hidden(args, kwargs)
             state.mode = self._decide_mode(state.step_index)
 
         if state.mode == _MODE_AGGRESSIVE:
@@ -216,22 +241,21 @@ class DualCacheBlockHook(ModelHook):
         output = self.fn_ref.original_forward(*args, **kwargs)
         if self.is_tail:
             out_hidden = output[self._metadata.return_hidden_states_index] if isinstance(output, tuple) else output
-            state.full_residual = _residual(out_hidden, state.head_input)
             state.deep_residual = _residual(out_hidden, state.fresh_split_input)
+            state.noise = out_hidden
             state.step_index += 1
         return output
 
     def _forward_aggressive(self, state: DualCacheState, args, kwargs):
         # Cold cache (should only happen if the schedule is disturbed): fall back to a full compute.
-        if state.full_residual is None:
+        if state.noise is None:
             return self._forward_fresh(state, args, kwargs)
-        hidden = self._hidden(args, kwargs)
+        # Every block is skipped; the entire cached output from the prior step is reused, ignoring the current input.
         if self.is_tail:
-            output = _add_residual(hidden, state.full_residual)
             state.step_index += 1
-            return self._pack(output, args, kwargs)
-        # Non-tail blocks pass their input straight through; the residual is re-applied once, at the tail.
-        return self._pack(hidden, args, kwargs)
+            return self._pack(state.noise, args, kwargs)
+        # Non-tail blocks pass their input straight through; the cached output is returned once, at the tail.
+        return self._pack(self._hidden(args, kwargs), args, kwargs)
 
     def _forward_conservative(self, state: DualCacheState, args, kwargs):
         if state.deep_residual is None:
@@ -243,6 +267,7 @@ class DualCacheBlockHook(ModelHook):
         hidden = self._hidden(args, kwargs)
         if self.is_tail:
             output = _add_residual(hidden, state.deep_residual)
+            state.noise = output
             state.step_index += 1
             return self._pack(output, args, kwargs)
         return self._pack(hidden, args, kwargs)
