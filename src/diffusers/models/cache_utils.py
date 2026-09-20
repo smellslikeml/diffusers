@@ -28,6 +28,7 @@ class CacheMixin:
         - [Pyramid Attention Broadcast](https://huggingface.co/papers/2408.12588)
         - [FasterCache](https://huggingface.co/papers/2410.19355)
         - [FirstBlockCache](https://github.com/chengzeyi/ParaAttention/blob/7a266123671b55e7e5a2fe9af3121f07a36afc78/README.md#first-block-cache-our-dynamic-caching)
+        - [Dual Feature Caching (DuCa)](https://huggingface.co/papers/2412.18911)
     """
 
     _cache_config = None
@@ -67,12 +68,14 @@ class CacheMixin:
         """
 
         from ..hooks import (
+            DualCacheConfig,
             FasterCacheConfig,
             FirstBlockCacheConfig,
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
+            apply_dual_cache,
             apply_faster_cache,
             apply_first_block_cache,
             apply_mag_cache,
@@ -92,6 +95,8 @@ class CacheMixin:
             apply_first_block_cache(self, config)
         elif isinstance(config, MagCacheConfig):
             apply_mag_cache(self, config)
+        elif isinstance(config, DualCacheConfig):
+            apply_dual_cache(self, config)
         elif isinstance(config, TextKVCacheConfig):
             apply_text_kv_cache(self, config)
         elif isinstance(config, PyramidAttentionBroadcastConfig):
@@ -105,6 +110,7 @@ class CacheMixin:
 
     def disable_cache(self) -> None:
         from ..hooks import (
+            DualCacheConfig,
             FasterCacheConfig,
             FirstBlockCacheConfig,
             HookRegistry,
@@ -113,6 +119,7 @@ class CacheMixin:
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
         )
+        from ..hooks.dual_cache import _DUAL_CACHE_BLOCK_HOOK, _DUAL_CACHE_LEADER_BLOCK_HOOK
         from ..hooks.faster_cache import _FASTER_CACHE_BLOCK_HOOK, _FASTER_CACHE_DENOISER_HOOK
         from ..hooks.first_block_cache import _FBC_BLOCK_HOOK, _FBC_LEADER_BLOCK_HOOK
         from ..hooks.mag_cache import _MAG_CACHE_BLOCK_HOOK, _MAG_CACHE_LEADER_BLOCK_HOOK
@@ -134,6 +141,9 @@ class CacheMixin:
         elif isinstance(self._cache_config, MagCacheConfig):
             registry.remove_hook(_MAG_CACHE_LEADER_BLOCK_HOOK, recurse=True)
             registry.remove_hook(_MAG_CACHE_BLOCK_HOOK, recurse=True)
+        elif isinstance(self._cache_config, DualCacheConfig):
+            registry.remove_hook(_DUAL_CACHE_LEADER_BLOCK_HOOK, recurse=True)
+            registry.remove_hook(_DUAL_CACHE_BLOCK_HOOK, recurse=True)
         elif isinstance(self._cache_config, PyramidAttentionBroadcastConfig):
             registry.remove_hook(_PYRAMID_ATTENTION_BROADCAST_HOOK, recurse=True)
         elif isinstance(self._cache_config, TextKVCacheConfig):
