@@ -46,3 +46,9 @@ Cache methods speedup diffusion transformers by storing and reusing intermediate
 [[autodoc]] MagCacheConfig
 
 [[autodoc]] apply_mag_cache
+
+## DualCacheConfig
+
+[[autodoc]] DualCacheConfig
+
+[[autodoc]] apply_dual_cache
