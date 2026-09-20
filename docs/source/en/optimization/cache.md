@@ -163,3 +163,36 @@ image = pipe("A cat playing chess", num_inference_steps=4).images[0]
 
 > [!TIP]
 > For pipelines that run Classifier-Free Guidance in a **batched** manner (like SDXL or Flux), the `hidden_states` processed by the model contain both conditional and unconditional branches concatenated together. The calibration process automatically accounts for this, producing a single array of ratios that represents the joint behavior. You can use this resulting array directly without modification.
+
+## DuCa (Dual Feature Caching)
+
+[DuCa (Dual Feature Caching)](https://huggingface.co/papers/2412.18911) is a training-free feature-caching schedule for diffusion transformers. It alternates between an *aggressive* strategy that reuses cached block residuals verbatim for maximum speedup and a *conservative* strategy that damps the reused residual to arrest the quality drop caused by reusing stale features, refreshing the cache at fixed cycle boundaries.
+
+Set up and pass a [`DualCacheConfig`] to a pipeline's transformer to enable it:
+
+- `cache_interval`: Length of each cache cycle. A full recomputation happens on the first step of every cycle; the remaining steps reuse cached features.
+- `aggressive_steps`: Number of steps immediately after a compute step that reuse the cached residual verbatim. The remaining steps of the cycle use the conservative strategy.
+- `conservative_scale`: Multiplier applied to the cached residual on conservative steps. Values below `1.0` damp error accumulation from aging features.
+- `retention_ratio`: Fraction of initial steps during which caching is disabled for stability.
+- `num_inference_steps`: Number of inference steps used by the pipeline, required to resolve `retention_ratio` into a step count.
+
+```python
+import torch
+from diffusers import FluxPipeline, DualCacheConfig
+
+pipe = FluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-dev",
+    torch_dtype=torch.bfloat16,
+).to("cuda")
+
+config = DualCacheConfig(
+    cache_interval=3,
+    aggressive_steps=1,
+    conservative_scale=0.95,
+    retention_ratio=0.2,
+    num_inference_steps=28,
+)
+pipe.transformer.enable_cache(config)
+
+image = pipe("A cat playing chess", num_inference_steps=28).images[0]
+```
