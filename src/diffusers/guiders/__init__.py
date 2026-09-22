@@ -26,6 +26,7 @@ if is_torch_available():
     from .guider_utils import BaseGuidance
     from .magnitude_aware_guidance import MagnitudeAwareGuidance
     from .perturbed_attention_guidance import PerturbedAttentionGuidance
+    from .rectified_classifier_free_guidance import RectifiedClassifierFreeGuidance
     from .skip_layer_guidance import SkipLayerGuidance
     from .smoothed_energy_guidance import SmoothedEnergyGuidance
     from .tangential_classifier_free_guidance import TangentialClassifierFreeGuidance
