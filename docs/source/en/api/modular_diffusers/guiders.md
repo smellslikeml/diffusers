@@ -14,6 +14,10 @@ Guiders are components in Modular Diffusers that control how the diffusion proce
 
 [[autodoc]] diffusers.guiders.classifier_free_zero_star_guidance.ClassifierFreeZeroStarGuidance
 
+## RectifiedClassifierFreeGuidance
+
+[[autodoc]] diffusers.guiders.rectified_classifier_free_guidance.RectifiedClassifierFreeGuidance
+
 ## SkipLayerGuidance
 
 [[autodoc]] diffusers.guiders.skip_layer_guidance.SkipLayerGuidance
