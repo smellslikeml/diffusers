@@ -37,3 +37,7 @@ Guiders are components in Modular Diffusers that control how the diffusion proce
 ## TangentialClassifierFreeGuidance
 
 [[autodoc]] diffusers.guiders.tangential_classifier_free_guidance.TangentialClassifierFreeGuidance
+
+## SemanticAwareGuidance
+
+[[autodoc]] diffusers.guiders.semantic_aware_guidance.SemanticAwareGuidance
