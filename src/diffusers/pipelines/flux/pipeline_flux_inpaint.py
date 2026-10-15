@@ -43,6 +43,7 @@ from ...utils import (
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import FluxPipelineOutput
+from .source_anchored_mask import build_source_anchored_mask, source_anchored_blend
 
 
 if is_torch_xla_available():
@@ -808,6 +809,10 @@ class FluxInpaintPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FluxIPAdapterM
         callback_on_step_end: Callable[[int, int], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
+        source_anchored_masking: bool = False,
+        mask_transition_width: float = 0.0,
+        temporal_mask_accumulation: bool = False,
+        anchor_schedule: str = "constant",
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -928,6 +933,21 @@ class FluxInpaintPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FluxIPAdapterM
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeline class.
             max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
+            source_anchored_masking (`bool`, *optional*, defaults to `False`):
+                Enable SAM-Flow source-anchored masked blending. Instead of the binary
+                ``(1 - mask) * source + mask * edit`` projection, the edit is applied only inside a soft,
+                time-varying mask while the rest of the latent is anchored to the source-image trajectory,
+                reducing background leakage and hard edit boundaries.
+            mask_transition_width (`float`, *optional*, defaults to `0.0`):
+                Half-width (in ``[0, 1]``) of the soft transition band around the mask boundary. Only used when
+                `source_anchored_masking` is `True`. `0.0` keeps a hard boundary.
+            temporal_mask_accumulation (`bool`, *optional*, defaults to `False`):
+                When `True`, the editable region grows monotonically across denoising steps (running max),
+                stabilizing the edit over time. Only used when `source_anchored_masking` is `True`.
+            anchor_schedule (`str`, *optional*, defaults to `"constant"`):
+                Time-varying edit strength: one of `"constant"`, `"linear_decay"`, `"cosine"`. Decaying
+                schedules taper edits in later steps for better boundary naturalness. Only used when
+                `source_anchored_masking` is `True`.
 
         Examples:
 
@@ -1132,6 +1152,7 @@ class FluxInpaintPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FluxIPAdapterM
             )
 
         # 6. Denoising loop
+        accumulated_mask = None
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -1183,7 +1204,21 @@ class FluxInpaintPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FluxIPAdapterM
                         init_latents_proper, torch.tensor([noise_timestep]), noise
                     )
 
-                latents = (1 - init_mask) * init_latents_proper + init_mask * latents
+                if source_anchored_masking:
+                    # SAM-Flow: edit only inside the (soft, time-varying) mask and
+                    # anchor the rest to the source-image latent trajectory.
+                    blend_mask, accumulated_mask = build_source_anchored_mask(
+                        init_mask,
+                        i,
+                        len(timesteps),
+                        transition_width=mask_transition_width,
+                        temporal_accumulation=temporal_mask_accumulation,
+                        accumulated_mask=accumulated_mask,
+                        anchor_schedule=anchor_schedule,
+                    )
+                    latents = source_anchored_blend(latents, init_latents_proper, blend_mask)
+                else:
+                    latents = (1 - init_mask) * init_latents_proper + init_mask * latents
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
