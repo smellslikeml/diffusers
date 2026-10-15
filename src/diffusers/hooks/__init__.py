@@ -16,6 +16,7 @@ from ..utils import is_torch_available
 
 
 if is_torch_available():
+    from .budget_cache import BudgetCacheConfig, apply_budget_cache, search_cache_schedule
     from .context_parallel import apply_context_parallel
     from .faster_cache import FasterCacheConfig, apply_faster_cache
     from .first_block_cache import FirstBlockCacheConfig, apply_first_block_cache
