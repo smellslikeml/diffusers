@@ -24,6 +24,7 @@ from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...schedulers import BlockRefinementScheduler
 from ...utils import BaseOutput, logging, replace_example_docstring
 from ..pipeline_utils import DiffusionPipeline
+from .logit_guidance import RewardLogitGuidance
 
 
 logger = logging.get_logger(__name__)
@@ -264,6 +265,7 @@ class LLaDA2Pipeline(DiffusionPipeline):
         eos_token_id: int | None = None,
         mask_token_id: int | None = None,
         generator: torch.Generator | None = None,
+        logit_guidance: RewardLogitGuidance | Callable[[torch.Tensor], torch.Tensor] | None = None,
         output_type: str = "text",
         return_dict: bool = True,
         callback_on_step_end: Callable[[int, int, dict], None]
@@ -327,6 +329,12 @@ class LLaDA2Pipeline(DiffusionPipeline):
                 Mask token ID to use for the template.
             generator (`torch.Generator`, *optional*):
                 RNG for sampling.
+            logit_guidance ([`RewardLogitGuidance`] or `Callable`, *optional*):
+                Training-free, plug-and-play reward guidance applied to each step's clean-prediction logits
+                before the scheduler commits tokens (a focused implementation of GILC, arXiv:2606.06303). A
+                [`RewardLogitGuidance`] steers generation toward a per-token reward via a Jacobian-free logit
+                correction; any callable mapping block logits `[batch, block_length, vocab]` to corrected logits
+                of the same shape is also accepted. `None` disables guidance.
             output_type (`str`, defaults to `"text"`):
                 Output format. `"text"` decodes sequences into strings (requires a tokenizer). `"seq"` returns raw
                 token ID sequences only.
@@ -464,6 +472,16 @@ class LLaDA2Pipeline(DiffusionPipeline):
 
                 logits = self.model(block_x, attention_mask=block_attn_mask, position_ids=block_position_ids).logits
                 block_logits = logits[:, -block_length:, :]
+
+                # Training-free plug-and-play reward guidance (GILC): correct the clean-prediction
+                # logits in place before the scheduler commits tokens. Same shape in, same shape out.
+                if logit_guidance is not None:
+                    if isinstance(logit_guidance, RewardLogitGuidance):
+                        block_logits = logit_guidance(
+                            block_logits, tokens=block_tokens, mask_token_id=mask_token_id
+                        )
+                    else:
+                        block_logits = logit_guidance(block_logits)
 
                 scheduler_output = self.scheduler.step(
                     model_output=block_logits,
