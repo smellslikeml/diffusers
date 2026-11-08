@@ -9,6 +9,21 @@ from ..utils import logging
 
 logger = logging.get_logger(__name__)
 
+_TORCH_DTYPE_DEPRECATION_MESSAGE = "Please use `dtype` instead."
+
+
+def _resolve_dtype(dtype, torch_dtype):
+    """Resolve the deprecated `torch_dtype` argument into `dtype`."""
+    if torch_dtype is None:
+        return dtype
+    if dtype is not None:
+        raise ValueError(
+            "You have passed both `dtype` and `torch_dtype`. Please only pass `dtype`, `torch_dtype` is deprecated."
+        )
+    deprecate("torch_dtype", "1.0.0", _TORCH_DTYPE_DEPRECATION_MESSAGE)
+    return torch_dtype
+
+
 # Mapping for deprecated Transformers classes to their replacements
 # This is used to handle models that reference deprecated class names in their configs
 # Reference: https://github.com/huggingface/transformers/issues/40822
@@ -49,6 +64,39 @@ def _maybe_remap_transformers_class(class_name: str) -> str | None:
         new_class = mapping["new_class"]
         logger.warning(f"{class_name} appears to have been deprecated in transformers. Using {new_class} instead.")
         return mapping["new_class"]
+
+    return None
+
+
+# Model classes that moved from a pipeline folder to `diffusers.models`. Existing `model_index.json` files still
+# reference them as `[<pipeline folder>, <class name>]`, so they are resolved to the top-level `diffusers` export
+# instead of the deprecated alias left in the pipeline folder.
+_RELOCATED_PIPELINE_CLASSES = {
+    ("ace_step", "AceStepConditionEncoder"),
+    ("audioldm2", "AudioLDM2ProjectionModel"),
+    ("flux", "ReduxImageEncoder"),
+    ("ltx", "LTXLatentUpsamplerModel"),
+    ("ltx2", "LTX2LatentUpsamplerModel"),
+    ("ltx2", "LTX2TextConnectors"),
+    ("stable_audio", "StableAudioProjectionModel"),
+    ("stable_audio_3", "StableAudio3DurationEmbedder"),
+    ("stable_diffusion", "CLIPImageProjection"),
+}
+
+
+def _maybe_remap_relocated_pipeline_class(library_name: str, class_name: str) -> str | None:
+    """
+    Check if a class listed under a pipeline folder has moved to `diffusers.models`.
+
+    Args:
+        library_name: The library or pipeline folder the class is listed under
+        class_name: The name of the class to check
+
+    Returns:
+        The library to load the class from if it has moved, None otherwise
+    """
+    if (library_name, class_name) in _RELOCATED_PIPELINE_CLASSES:
+        return "diffusers"
 
     return None
 

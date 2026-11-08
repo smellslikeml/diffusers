@@ -32,9 +32,9 @@ from transformers import (
 )
 
 from ...models import AutoencoderKL
+from ...models.condition_embedders import AudioLDM2ProjectionModel
 from ...schedulers import KarrasDiffusionSchedulers
 from ...utils import (
-    deprecate,
     is_accelerate_available,
     is_accelerate_version,
     is_librosa_available,
@@ -44,7 +44,7 @@ from ...utils import (
 from ...utils.import_utils import is_transformers_version
 from ...utils.torch_utils import empty_device_cache, randn_tensor
 from ..pipeline_utils import AudioPipelineOutput, DiffusionPipeline
-from .modeling_audioldm2 import AudioLDM2ProjectionModel, AudioLDM2UNet2DConditionModel
+from .modeling_audioldm2 import AudioLDM2UNet2DConditionModel
 
 
 if is_librosa_available():
@@ -222,34 +222,6 @@ class AudioLDM2Pipeline(DiffusionPipeline):
             vocoder=vocoder,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
-
-    # Copied from diffusers.pipelines.pipeline_utils.StableDiffusionMixin.enable_vae_slicing
-    def enable_vae_slicing(self):
-        r"""
-        Enable sliced VAE decoding. When this option is enabled, the VAE will split the input tensor in slices to
-        compute decoding in several steps. This is useful to save some memory and allow larger batch sizes.
-        """
-        depr_message = f"Calling `enable_vae_slicing()` on a `{self.__class__.__name__}` is deprecated and this method will be removed in a future version. Please use `pipe.vae.enable_slicing()`."
-        deprecate(
-            "enable_vae_slicing",
-            "0.40.0",
-            depr_message,
-        )
-        self.vae.enable_slicing()
-
-    # Copied from diffusers.pipelines.pipeline_utils.StableDiffusionMixin.disable_vae_slicing
-    def disable_vae_slicing(self):
-        r"""
-        Disable sliced VAE decoding. If `enable_vae_slicing` was previously enabled, this method will go back to
-        computing decoding in one step.
-        """
-        depr_message = f"Calling `disable_vae_slicing()` on a `{self.__class__.__name__}` is deprecated and this method will be removed in a future version. Please use `pipe.vae.disable_slicing()`."
-        deprecate(
-            "disable_vae_slicing",
-            "0.40.0",
-            depr_message,
-        )
-        self.vae.disable_slicing()
 
     def enable_model_cpu_offload(self, gpu_id: int | None = None, device: torch.device | str = "cuda"):
         r"""
@@ -893,7 +865,7 @@ class AudioLDM2Pipeline(DiffusionPipeline):
         callback_steps: int | None = 1,
         cross_attention_kwargs: dict[str, Any] | None = None,
         output_type: str | None = "np",
-    ):
+    ) -> AudioPipelineOutput | tuple:
         r"""
         The call function to the pipeline for generation.
 

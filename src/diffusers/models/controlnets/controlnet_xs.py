@@ -1,4 +1,4 @@
-# Copyright 2025 The HuggingFace Team. All rights reserved.
+# Copyright 2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -502,7 +502,7 @@ class ControlNetXSAdapter(ModelMixin, AttentionMixin, ConfigMixin):
 
         return model
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, **kwargs) -> None:
         raise ValueError(
             "A ControlNetXSAdapter cannot be run by itself. Use it together with a UNet2DConditionModel to instantiate a UNetControlNetXSModel."
         )

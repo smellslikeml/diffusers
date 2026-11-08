@@ -11,14 +11,14 @@ specific language governing permissions and limitations under the License. -->
 
 # HunyuanVideo15Transformer3DModel
 
-A Diffusion Transformer model for 3D video-like data used in [HunyuanVideo1.5](https://github.com/Tencent/HunyuanVideo1-1.5).
+A Diffusion Transformer model for 3D video-like data used in [HunyuanVideo1.5](https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5).
 
 The model can be loaded with the following code snippet.
 
 ```python
 from diffusers import HunyuanVideo15Transformer3DModel
 
-transformer = HunyuanVideo15Transformer3DModel.from_pretrained("hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v" subfolder="transformer", torch_dtype=torch.bfloat16)
+transformer = HunyuanVideo15Transformer3DModel.from_pretrained("hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v" subfolder="transformer", dtype=torch.bfloat16)
 ```
 
 ## HunyuanVideo15Transformer3DModel

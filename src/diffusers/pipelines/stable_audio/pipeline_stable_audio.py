@@ -23,12 +23,12 @@ from transformers import (
 )
 
 from ...models import AutoencoderOobleck, StableAudioDiTModel
+from ...models.condition_embedders import StableAudioProjectionModel
 from ...models.embeddings import get_1d_rotary_pos_embed
 from ...schedulers import EDMDPMSolverMultistepScheduler
-from ...utils import deprecate, is_torch_xla_available, logging, replace_example_docstring
+from ...utils import is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import AudioPipelineOutput, DiffusionPipeline
-from .modeling_stable_audio import StableAudioProjectionModel
 
 
 if is_torch_xla_available():
@@ -123,34 +123,6 @@ class StableAudioPipeline(DiffusionPipeline):
             scheduler=scheduler,
         )
         self.rotary_embed_dim = self.transformer.config.attention_head_dim // 2
-
-    # Copied from diffusers.pipelines.pipeline_utils.StableDiffusionMixin.enable_vae_slicing
-    def enable_vae_slicing(self):
-        r"""
-        Enable sliced VAE decoding. When this option is enabled, the VAE will split the input tensor in slices to
-        compute decoding in several steps. This is useful to save some memory and allow larger batch sizes.
-        """
-        depr_message = f"Calling `enable_vae_slicing()` on a `{self.__class__.__name__}` is deprecated and this method will be removed in a future version. Please use `pipe.vae.enable_slicing()`."
-        deprecate(
-            "enable_vae_slicing",
-            "0.40.0",
-            depr_message,
-        )
-        self.vae.enable_slicing()
-
-    # Copied from diffusers.pipelines.pipeline_utils.StableDiffusionMixin.disable_vae_slicing
-    def disable_vae_slicing(self):
-        r"""
-        Disable sliced VAE decoding. If `enable_vae_slicing` was previously enabled, this method will go back to
-        computing decoding in one step.
-        """
-        depr_message = f"Calling `disable_vae_slicing()` on a `{self.__class__.__name__}` is deprecated and this method will be removed in a future version. Please use `pipe.vae.disable_slicing()`."
-        deprecate(
-            "disable_vae_slicing",
-            "0.40.0",
-            depr_message,
-        )
-        self.vae.disable_slicing()
 
     def encode_prompt(
         self,
@@ -511,7 +483,7 @@ class StableAudioPipeline(DiffusionPipeline):
         callback: Callable[[int, int, torch.Tensor], None] | None = None,
         callback_steps: int | None = 1,
         output_type: str | None = "pt",
-    ):
+    ) -> AudioPipelineOutput | tuple:
         r"""
         The call function to the pipeline for generation.
 

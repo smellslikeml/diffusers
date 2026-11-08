@@ -149,7 +149,7 @@ If you want to learn more about how the training loop works, check out the [Unde
 
 Now you’re ready to launch the training script! 🚀
 
-For this example training, you'll use the [fusing/fill50k](https://huggingface.co/datasets/fusing/fill50k) dataset. You can also create and use your own dataset if you want (see the [Create a dataset for training](https://moon-ci-docs.huggingface.co/docs/diffusers/pr_5512/en/training/create_dataset) guide).
+For this example training, you'll use the [fusing/fill50k](https://huggingface.co/datasets/fusing/fill50k) dataset. You can also create and use your own dataset if you want (see the [Create a dataset for training](create_dataset) guide).
 
 Set the environment variable `MODEL_DIR` to a model id on the Hub or a path to a local model and `OUTPUT_DIR` to where you want to save the model.
 
@@ -192,9 +192,9 @@ from diffusers import StableDiffusionXLAdapterPipeline, T2IAdapter, EulerAncestr
 from diffusers.utils import load_image
 import torch
 
-adapter = T2IAdapter.from_pretrained("path/to/adapter", torch_dtype=torch.float16)
+adapter = T2IAdapter.from_pretrained("path/to/adapter", dtype=torch.float16)
 pipeline = StableDiffusionXLAdapterPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0", adapter=adapter, torch_dtype=torch.float16
+    "stabilityai/stable-diffusion-xl-base-1.0", adapter=adapter, dtype=torch.float16
 )
 
 pipeline.scheduler = EulerAncestralDiscreteSchedulerTest.from_config(pipe.scheduler.config)

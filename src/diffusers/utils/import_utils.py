@@ -1,4 +1,4 @@
-# Copyright 2025 The HuggingFace Team. All rights reserved.
+# Copyright 2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,7 +49,6 @@ ENV_VARS_TRUE_AND_AUTO_VALUES = ENV_VARS_TRUE_VALUES.union({"AUTO"})
 
 USE_TF = os.environ.get("USE_TF", "AUTO").upper()
 USE_TORCH = os.environ.get("USE_TORCH", "AUTO").upper()
-USE_JAX = os.environ.get("USE_FLAX", "AUTO").upper()
 USE_SAFETENSORS = os.environ.get("USE_SAFETENSORS", "AUTO").upper()
 DIFFUSERS_SLOW_IMPORT = os.environ.get("DIFFUSERS_SLOW_IMPORT", "FALSE").upper()
 DIFFUSERS_SLOW_IMPORT = DIFFUSERS_SLOW_IMPORT in ENV_VARS_TRUE_VALUES
@@ -95,6 +94,25 @@ def _is_package_available(pkg_name: str, get_dist_name: bool = False) -> tuple[b
     return pkg_exists, pkg_version
 
 
+def _is_distribution_installed(name: str) -> tuple[bool, str]:
+    """
+    Looks `name` up in the installed distribution metadata, resolving import names such as `cv2` to the distribution
+    that provides them (`opencv-python`).
+
+    Unlike `_is_package_available`, nothing here reaches the import machinery, so this is the one to use for a name
+    that comes from a downloaded repository: `importlib.util.find_spec("a.b.c")` imports `a` and `a.b` to find `c`,
+    which executes whatever code those packages contain.
+    """
+    for candidate in (_package_map or {}).get(name) or [name]:
+        try:
+            return True, importlib_metadata.version(candidate)
+        except (importlib_metadata.PackageNotFoundError, ValueError):
+            # `ValueError` is what an empty name raises; neither is something the caller can act on.
+            continue
+
+    return False, "N/A"
+
+
 if USE_TORCH in ENV_VARS_TRUE_AND_AUTO_VALUES and USE_TF not in ENV_VARS_TRUE_VALUES:
     _torch_available, _torch_version = _is_package_available("torch")
 
@@ -102,20 +120,6 @@ else:
     logger.info("Disabling PyTorch because USE_TORCH is set")
     _torch_available = False
     _torch_version = "N/A"
-
-_jax_version = "N/A"
-_flax_version = "N/A"
-if USE_JAX in ENV_VARS_TRUE_AND_AUTO_VALUES:
-    _flax_available = importlib.util.find_spec("jax") is not None and importlib.util.find_spec("flax") is not None
-    if _flax_available:
-        try:
-            _jax_version = importlib_metadata.version("jax")
-            _flax_version = importlib_metadata.version("flax")
-            logger.info(f"JAX version {_jax_version}, Flax version {_flax_version} available.")
-        except importlib_metadata.PackageNotFoundError:
-            _flax_available = False
-else:
-    _flax_available = False
 
 if USE_SAFETENSORS in ENV_VARS_TRUE_AND_AUTO_VALUES:
     _safetensors_available, _safetensors_version = _is_package_available("safetensors")
@@ -193,6 +197,7 @@ except importlib_metadata.PackageNotFoundError:
 _torch_xla_available, _torch_xla_version = _is_package_available("torch_xla")
 _torch_npu_available, _torch_npu_version = _is_package_available("torch_npu")
 _torch_mlu_available, _torch_mlu_version = _is_package_available("torch_mlu")
+_torch_tpu_available, _torch_tpu_version = _is_package_available("torch_tpu")
 _torch_neuronx_available, _torch_neuronx_version = _is_package_available("torch_neuronx")
 _transformers_available, _transformers_version = _is_package_available("transformers")
 _hf_hub_available, _hf_hub_version = _is_package_available("huggingface_hub")
@@ -228,11 +233,12 @@ _nltk_available, _nltk_version = _is_package_available("nltk")
 _cosmos_guardrail_available, _cosmos_guardrail_version = _is_package_available("cosmos_guardrail")
 _sageattention_available, _sageattention_version = _is_package_available("sageattention")
 _flash_attn_available, _flash_attn_version = _is_package_available("flash_attn")
+_flashinfer_available, _flashinfer_version = _is_package_available("flashinfer", get_dist_name=True)
 _flash_attn_3_available, _flash_attn_3_version = _is_package_available("flash_attn_3")
-_aiter_available, _aiter_version = _is_package_available("aiter", get_dist_name=True)
 _kornia_available, _kornia_version = _is_package_available("kornia")
 _nvidia_modelopt_available, _nvidia_modelopt_version = _is_package_available("modelopt", get_dist_name=True)
 _auto_round_available, _auto_round_version = _is_package_available("auto_round")
+_sdnq_available, _sdnq_version = _is_package_available("sdnq")
 _flashpack_available, _flashpack_version = _is_package_available("flashpack")
 _av_available, _av_version = _is_package_available("av")
 
@@ -253,32 +259,16 @@ def is_torch_mlu_available():
     return _torch_mlu_available
 
 
+def is_torch_tpu_available():
+    return _torch_tpu_available
+
+
 def is_torch_neuronx_available():
     return _torch_neuronx_available
 
 
-def is_flax_available():
-    return _flax_available
-
-
 def is_transformers_available():
     return _transformers_available
-
-
-def is_transformers_flax_compatible():
-    # Flax classes (e.g. FlaxCLIPTextModel, FlaxPreTrainedModel) were removed from
-    # transformers main on the path to its v5 release. Gate Flax pipeline registration
-    # on transformers still shipping them so `import diffusers` doesn't crash.
-    # Name avoids the `is_*_available()` pattern so utils/check_dummies.py keeps
-    # generating the `flax_and_transformers` backend group when this is combined with
-    # the legacy is_flax_available()/is_transformers_available() pair.
-    if not (_transformers_available and _flax_available):
-        return False
-    try:
-        import transformers
-    except ImportError:
-        return False
-    return hasattr(transformers, "FlaxPreTrainedModel")
 
 
 def is_inflect_available():
@@ -389,6 +379,10 @@ def is_gguf_available():
     return _gguf_available
 
 
+def is_flashinfer_available():
+    return _flashinfer_available
+
+
 def is_flashpack_available():
     return _flashpack_available
 
@@ -407,6 +401,10 @@ def is_nvidia_modelopt_available():
 
 def is_auto_round_available():
     return _auto_round_available
+
+
+def is_sdnq_available():
+    return _sdnq_available
 
 
 def is_timm_available():
@@ -445,10 +443,6 @@ def is_flash_attn_3_available():
     return _flash_attn_3_available
 
 
-def is_aiter_available():
-    return _aiter_available
-
-
 def is_kornia_available():
     return _kornia_available
 
@@ -456,12 +450,6 @@ def is_kornia_available():
 def is_av_available():
     return _av_available
 
-
-# docstyle-ignore
-FLAX_IMPORT_ERROR = """
-{0} requires the FLAX library but it was not found in your environment. Checkout the instructions on the
-installation page: https://github.com/google/flax and follow the ones that match your environment.
-"""
 
 # docstyle-ignore
 INFLECT_IMPORT_ERROR = """
@@ -599,6 +587,10 @@ QUANTO_IMPORT_ERROR = """
 install optimum-quanto`
 """
 
+SDNQ_IMPORT_ERROR = """
+{0} requires the sdnq library but it was not found in your environment. You can install it with pip: `pip install sdnq`
+"""
+
 # docstyle-ignore
 PYTORCH_RETINAFACE_IMPORT_ERROR = """
 {0} requires the pytorch_retinaface library but it was not found in your environment. You can install it with pip: `pip install pytorch_retinaface`
@@ -623,7 +615,6 @@ following the AWS Neuron documentation: https://awsdocs-neuron.readthedocs-hoste
 BACKENDS_MAPPING = OrderedDict(
     [
         ("bs4", (is_bs4_available, BS4_IMPORT_ERROR)),
-        ("flax", (is_flax_available, FLAX_IMPORT_ERROR)),
         ("inflect", (is_inflect_available, INFLECT_IMPORT_ERROR)),
         ("onnx", (is_onnx_available, ONNX_IMPORT_ERROR)),
         ("opencv", (is_opencv_available, OPENCV_IMPORT_ERROR)),
@@ -647,6 +638,7 @@ BACKENDS_MAPPING = OrderedDict(
         ("gguf", (is_gguf_available, GGUF_IMPORT_ERROR)),
         ("torchao", (is_torchao_available, TORCHAO_IMPORT_ERROR)),
         ("quanto", (is_optimum_quanto_available, QUANTO_IMPORT_ERROR)),
+        ("sdnq", (is_sdnq_available, SDNQ_IMPORT_ERROR)),
         ("pytorch_retinaface", (is_pytorch_retinaface_available, PYTORCH_RETINAFACE_IMPORT_ERROR)),
         ("better_profanity", (is_better_profanity_available, BETTER_PROFANITY_IMPORT_ERROR)),
         ("nltk", (is_nltk_available, NLTK_IMPORT_ERROR)),
@@ -862,6 +854,22 @@ def is_gguf_version(operation: str, version: str):
 
 
 @cache
+def is_sdnq_version(operation: str, version: str):
+    """
+    Compares the current sdnq version to a given reference with an operation.
+
+    Args:
+        operation (`str`):
+            A string representation of an operator, such as `">"` or `"<="`
+        version (`str`):
+            A version string
+    """
+    if not _sdnq_available:
+        return False
+    return compare_versions(parse(_sdnq_version), operation, version)
+
+
+@cache
 def is_torchao_version(operation: str, version: str):
     """
     Compares the current torchao version to a given reference with an operation.
@@ -955,22 +963,6 @@ def is_flash_attn_version(operation: str, version: str):
     if not _flash_attn_available:
         return False
     return compare_versions(parse(_flash_attn_version), operation, version)
-
-
-@cache
-def is_aiter_version(operation: str, version: str):
-    """
-    Compares the current aiter version to a given reference with an operation.
-
-    Args:
-        operation (`str`):
-            A string representation of an operator, such as `">"` or `"<="`
-        version (`str`):
-            A version string
-    """
-    if not _aiter_available:
-        return False
-    return compare_versions(parse(_aiter_version), operation, version)
 
 
 def get_objects_from_module(module):

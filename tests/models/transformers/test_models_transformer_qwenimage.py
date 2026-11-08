@@ -1,4 +1,4 @@
-# Copyright 2025 HuggingFace Inc.
+# Copyright 2026 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import pytest
 import torch
 
@@ -22,6 +21,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from ...testing_utils import enable_full_determinism, torch_device
 from ..testing_utils import (
+    AttentionBackendTesterMixin,
     AttentionTesterMixin,
     BaseModelTesterConfig,
     BitsAndBytesTesterMixin,
@@ -31,6 +31,9 @@ from ..testing_utils import (
     LoraTesterMixin,
     MemoryTesterMixin,
     ModelTesterMixin,
+    TensorParallelNeuronTesterMixin,
+    TensorParallelTesterMixin,
+    TensorParallelTPUTesterMixin,
     TorchAoTesterMixin,
     TorchCompileTesterMixin,
     TrainingTesterMixin,
@@ -78,20 +81,20 @@ class QwenImageTransformerTesterConfig(BaseModelTesterConfig):
             "axes_dims_rope": (8, 4, 4),
         }
 
-    def get_dummy_inputs(self, batch_size: int = 1) -> dict[str, torch.Tensor]:
+    def get_dummy_inputs(self, batch_size: int = 1, device=torch_device) -> dict[str, torch.Tensor]:
         num_latent_channels = embedding_dim = 16
         height = width = 4
         sequence_length = 8
         vae_scale_factor = 4
 
         hidden_states = randn_tensor(
-            (batch_size, height * width, num_latent_channels), generator=self.generator, device=torch_device
+            (batch_size, height * width, num_latent_channels), generator=self.generator, device=device
         )
         encoder_hidden_states = randn_tensor(
-            (batch_size, sequence_length, embedding_dim), generator=self.generator, device=torch_device
+            (batch_size, sequence_length, embedding_dim), generator=self.generator, device=device
         )
-        encoder_hidden_states_mask = torch.ones((batch_size, sequence_length)).to(torch_device, torch.long)
-        timestep = torch.tensor([1.0]).to(torch_device).expand(batch_size)
+        encoder_hidden_states_mask = torch.ones((batch_size, sequence_length)).to(device, torch.long)
+        timestep = torch.tensor([1.0]).to(device).expand(batch_size)
         orig_height = height * 2 * vae_scale_factor
         orig_width = width * 2 * vae_scale_factor
         img_shapes = [(1, orig_height // vae_scale_factor // 2, orig_width // vae_scale_factor // 2)] * batch_size
@@ -250,6 +253,21 @@ class TestQwenImageTransformerAttention(QwenImageTransformerTesterConfig, Attent
     """Attention processor tests for QwenImage Transformer."""
 
 
+class TestQwenImageTransformerAttentionBackend(QwenImageTransformerTesterConfig, AttentionBackendTesterMixin):
+    """Attention backend tests for QwenImage Transformer."""
+
+    unsupported_attn_backends = ["flash_hub", "_flash_3_hub", "sage_hub", "sage_blackwell_hub"]
+
+    def get_dummy_inputs(self, batch_size: int = 2):
+        inputs = super().get_dummy_inputs(batch_size=batch_size)
+        mask = inputs["encoder_hidden_states_mask"]
+        mask[...] = 0
+        mask[0, :2] = 1
+        mask[1, :6] = 1
+        inputs["encoder_hidden_states_mask"] = mask.bool()
+        return inputs
+
+
 class TestQwenImageTransformerContextParallel(QwenImageTransformerTesterConfig, ContextParallelTesterMixin):
     """Context Parallel inference tests for QwenImage Transformer."""
 
@@ -268,9 +286,9 @@ class TestQwenImageTransformerContextParallelAttnBackends(
 ):
     """Context Parallel inference x attention backends tests for QwenImage Transformer"""
 
-    # QwenImage always passes a joint attention mask (text + image), which flash_hub and
-    # _flash_3_hub do not support.
-    unsupported_attn_backends = ["flash_hub", "_flash_3_hub"]
+    # QwenImage always passes a joint attention mask (text + image), which flash_hub,
+    # _flash_3_hub and the sage hub backends do not support.
+    unsupported_attn_backends = ["flash_hub", "_flash_3_hub", "sage_hub", "sage_blackwell_hub"]
 
     def get_dummy_inputs(self, batch_size: int = 1) -> dict[str, torch.Tensor]:
         inputs = super().get_dummy_inputs(batch_size=batch_size)
@@ -282,20 +300,32 @@ class TestQwenImageTransformerContextParallelAttnBackends(
         return inputs
 
 
+class TestQwenImageTransformerTensorParallel(QwenImageTransformerTesterConfig, TensorParallelTesterMixin):
+    """Tensor Parallel inference tests for QwenImage Transformer (CUDA/XPU multi-accelerator)."""
+
+
+class TestQwenImageTransformerTensorParallelTPU(QwenImageTransformerTesterConfig, TensorParallelTPUTesterMixin):
+    """Tensor Parallel inference test for QwenImage Transformer on TPU."""
+
+    def get_init_dict(self):
+        # One head per chip.
+        return {**super().get_init_dict(), "num_attention_heads": self.tp_world_size}
+
+    def test_tensor_parallel_tpu_inference(self):
+        # TPU numerics differ by ~1e-2 between sharded and unsharded QwenImage (~1e-7 on CPU).
+        super().test_tensor_parallel_tpu_inference(atol=2e-2, rtol=2e-2)
+
+
+class TestQwenImageTransformerTensorParallelNeuron(QwenImageTransformerTesterConfig, TensorParallelNeuronTesterMixin):
+    """Tensor Parallel inference test for QwenImage Transformer on AWS Neuron."""
+
+
 class TestQwenImageTransformerLoRA(QwenImageTransformerTesterConfig, LoraTesterMixin):
     """LoRA adapter tests for QwenImage Transformer."""
 
 
 class TestQwenImageTransformerLoRAHotSwap(QwenImageTransformerTesterConfig, LoraHotSwappingForModelTesterMixin):
     """LoRA hot-swapping tests for QwenImage Transformer."""
-
-    @pytest.mark.xfail(True, reason="Recompilation issues.", strict=True)
-    def test_hotswapping_compiled_model_linear(self):
-        super().test_hotswapping_compiled_model_linear()
-
-    @pytest.mark.xfail(True, reason="Recompilation issues.", strict=True)
-    def test_hotswapping_compiled_model_both_linear_and_other(self):
-        super().test_hotswapping_compiled_model_both_linear_and_other()
 
     @property
     def different_shapes_for_compilation(self):
@@ -422,9 +452,37 @@ class TestQwenImageTransformerCompile(QwenImageTransformerTesterConfig, TorchCom
         assert not torch.allclose(output_no_mask.sample, output_with_padding.sample, atol=1e-3)
 
 
-class TestQwenImageTransformerBitsAndBytes(QwenImageTransformerTesterConfig, BitsAndBytesTesterMixin):
+class QwenImageTransformerQuantTesterConfig(QwenImageTransformerTesterConfig):
+    """Shared config for quantized QwenImage Transformer tests (loads the tiny Hub checkpoint)."""
+
+    @property
+    def pretrained_model_name_or_path(self):
+        return "hf-internal-testing/tiny-qwenimage-pipe"
+
+    @property
+    def pretrained_model_kwargs(self):
+        return {"subfolder": "transformer"}
+
+    def get_dummy_inputs(self, batch_size: int = 1) -> dict[str, torch.Tensor]:
+        """Override to match the compute dtype the quantizer loads the model in."""
+        inputs = super().get_dummy_inputs(batch_size=batch_size)
+        return {
+            k: v.to(self.torch_dtype) if torch.is_tensor(v) and torch.is_floating_point(v) else v
+            for k, v in inputs.items()
+        }
+
+
+class TestQwenImageTransformerBitsAndBytes(QwenImageTransformerQuantTesterConfig, BitsAndBytesTesterMixin):
     """BitsAndBytes quantization tests for QwenImage Transformer."""
 
+    @property
+    def torch_dtype(self):
+        return torch.float16
 
-class TestQwenImageTransformerTorchAo(QwenImageTransformerTesterConfig, TorchAoTesterMixin):
+
+class TestQwenImageTransformerTorchAo(QwenImageTransformerQuantTesterConfig, TorchAoTesterMixin):
     """TorchAO quantization tests for QwenImage Transformer."""
+
+    @property
+    def torch_dtype(self):
+        return torch.bfloat16

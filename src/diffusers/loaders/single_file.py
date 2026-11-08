@@ -1,4 +1,4 @@
-# Copyright 2025 The HuggingFace Team. All rights reserved.
+# Copyright 2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ from huggingface_hub.utils import LocalEntryNotFoundError, validate_hf_hub_args
 from packaging import version
 from typing_extensions import Self
 
-from ..utils import deprecate, is_transformers_available, logging
+from ..utils import _maybe_remap_relocated_pipeline_class, deprecate, is_transformers_available, logging
 from .single_file_utils import (
     SingleFileComponentError,
     _is_legacy_scheduler_kwargs,
@@ -64,6 +64,11 @@ def load_single_file_sub_model(
     disable_mmap=False,
     **kwargs,
 ):
+    relocated_library_name = _maybe_remap_relocated_pipeline_class(library_name, class_name)
+    if relocated_library_name is not None:
+        library_name = relocated_library_name
+        is_pipeline_module = False
+
     if is_pipeline_module:
         pipeline_module = getattr(pipelines, library_name)
         class_obj = getattr(pipeline_module, class_name)
@@ -281,7 +286,7 @@ class FromSingleFileMixin:
                     - A link to the `.ckpt` file (for example
                       `"https://huggingface.co/<repo_id>/blob/main/<path_to_file>.ckpt"`) on the Hub.
                     - A path to a *file* containing all pipeline weights.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
+            dtype (`str` or `torch.dtype`, *optional*):
                 Override the default `torch.dtype` and load the model with another dtype.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
@@ -361,6 +366,8 @@ class FromSingleFileMixin:
         local_files_only = kwargs.pop("local_files_only", False)
         revision = kwargs.pop("revision", None)
         torch_dtype = kwargs.pop("torch_dtype", None)
+        dtype = kwargs.pop("dtype", None)
+        torch_dtype = dtype if dtype is not None else torch_dtype
         disable_mmap = kwargs.pop("disable_mmap", False)
 
         is_legacy_loading = False

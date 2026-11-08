@@ -11,14 +11,14 @@ specific language governing permissions and limitations under the License. -->
 
 # AutoencoderKLHunyuanVideo15
 
-The 3D variational autoencoder (VAE) model with KL loss used in [HunyuanVideo1.5](https://github.com/Tencent/HunyuanVideo1-1.5) by Tencent.
+The 3D variational autoencoder (VAE) model with KL loss used in [HunyuanVideo1.5](https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5) by Tencent.
 
 The model can be loaded with the following code snippet.
 
 ```python
 from diffusers import AutoencoderKLHunyuanVideo15
 
-vae = AutoencoderKLHunyuanVideo15.from_pretrained("hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v", subfolder="vae", torch_dtype=torch.float32)
+vae = AutoencoderKLHunyuanVideo15.from_pretrained("hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v", subfolder="vae", dtype=torch.float32)
 
 # make sure to enable tiling to avoid OOM
 vae.enable_tiling()
