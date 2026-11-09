@@ -792,6 +792,8 @@
   - sections:
     - local: api/schedulers/overview
       title: Overview
+    - local: api/schedulers/aflops
+      title: AFloPSScheduler
     - local: api/schedulers/block_refinement
       title: BlockRefinementScheduler
     - local: api/schedulers/cm_stochastic_iterative

@@ -461,6 +461,7 @@ else:
     _import_structure["quantizers"] = ["DiffusersQuantizer"]
     _import_structure["schedulers"].extend(
         [
+            "AFloPSScheduler",
             "AmusedScheduler",
             "BlockRefinementScheduler",
             "BlockRefinementSchedulerOutput",
@@ -1392,6 +1393,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         )
         from .quantizers import DiffusersQuantizer
         from .schedulers import (
+            AFloPSScheduler,
             AmusedScheduler,
             BlockRefinementScheduler,
             BlockRefinementSchedulerOutput,
